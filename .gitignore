@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Credentials and secrets
+*.pem
+*.key
+id_ed25519*
+id_rsa*
+*.ppk
+.env
+eumetsat_dataservices_API.txt
+*_credentials*
+
+# Runtime state (never commit operational data)
+batch_status.json
+download_launcher_status.json
+auto_upload_status.json
+server_verification.json
+auto_upload_resume_task_audit.json
+dashboard_startup_upload_recovery.json
+batch_queue.json
+notification_state.json
+*_manifest.json
+*_ledger.jsonl
+*.lock
+*.log
+*.part
+conda_tmp/
+
+# Batch data directories (never commit raw satellite data)
+*_batches/
+GEO_Cloud_2024*/
