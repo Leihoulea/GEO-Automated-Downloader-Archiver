@@ -25,7 +25,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$PathConfig = Join-Path $PSScriptRoot "..\geo_ring_cloud_stage1\geo_ring_cloud_path_configuration.ps1"
+$PathConfig = Join-Path $PSScriptRoot "geo_ring_cloud_path_configuration.ps1"
 . $PathConfig
 $COMPONENT_ROLE = "data_transfer_orchestrator"
 

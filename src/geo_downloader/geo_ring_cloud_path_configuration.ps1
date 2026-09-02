@@ -21,19 +21,19 @@ $GeoRingCoreCodeRoot = if ($env:GEO_RING_CODE_ROOT) {
 $GeoRingDataCheckRoot = if ($env:GEO_RING_DATA_CHECK_ROOT) {
     [System.IO.Path]::GetFullPath($env:GEO_RING_DATA_CHECK_ROOT)
 } else {
-    Join-Path $GeoRingProjectRoot "data_check_report"
+    Join-Path $GeoRingProjectRoot "data_check"
 }
 
 $GeoRingRunsRoot = if ($env:GEO_RING_RUNS_ROOT) {
     [System.IO.Path]::GetFullPath($env:GEO_RING_RUNS_ROOT)
 } else {
-    Join-Path $GeoRingProjectRoot "geo_ring_cloud_stage1_time_runs"
+    Join-Path $GeoRingProjectRoot "runs"
 }
 
 $GeoRingExternalGeoCloudRoot = if ($env:GEO_RING_EXTERNAL_GEO_CLOUD_ROOT) {
     [System.IO.Path]::GetFullPath($env:GEO_RING_EXTERNAL_GEO_CLOUD_ROOT)
 } else {
-    "E:\GEO_Cloud_2024"
+    Join-Path $GeoRingProjectRoot "data\GEO_Cloud_2024"
 }
 
 $GeoRingClaas3Root = if ($env:GEO_RING_CLAAS3_ROOT) {
@@ -45,19 +45,19 @@ $GeoRingClaas3Root = if ($env:GEO_RING_CLAAS3_ROOT) {
 $GeoRingExternalEpicL2Root = if ($env:GEO_RING_EXTERNAL_EPIC_L2_ROOT) {
     [System.IO.Path]::GetFullPath($env:GEO_RING_EXTERNAL_EPIC_L2_ROOT)
 } else {
-    "F:\DSCOVR_EPIC_L2_CLOUD_03_2024.03"
+    Join-Path $GeoRingExternalGeoCloudRoot "DSCOVR_EPIC_L2_CLOUD_03_2024.03"
 }
 
 $GeoRingExternalEpicCompositeRoot = if ($env:GEO_RING_EXTERNAL_EPIC_COMPOSITE_ROOT) {
     [System.IO.Path]::GetFullPath($env:GEO_RING_EXTERNAL_EPIC_COMPOSITE_ROOT)
 } else {
-    "F:\DSCOVR_EPIC_L2_COMPOSITE_02_2024.01"
+    Join-Path $GeoRingExternalGeoCloudRoot "DSCOVR_EPIC_L2_COMPOSITE_02_2024.01"
 }
 
 $GeoRingEumetsatCredentialsFile = if ($env:GEO_RING_EUMETSAT_CREDENTIALS_FILE) {
     [System.IO.Path]::GetFullPath($env:GEO_RING_EUMETSAT_CREDENTIALS_FILE)
 } else {
-    Join-Path $GeoRingThirdReportRoot "eumetsat_dataservices_API.txt"
+    Join-Path $GeoRingProjectRoot "config\eumetsat_credentials.txt"
 }
 
 $GeoRingPythonExe = if ($env:GEO_RING_PYTHON_EXE) {

@@ -1,0 +1,91 @@
+# GEO Automated Downloader & Archiver - Example Configuration
+#
+# Copy this file to config/config.toml and edit the values for your
+# environment.  Alternatively, set the corresponding environment variables
+# (documented below each section).
+
+# ---------------------------------------------------------------------------
+# Batch root directory
+# ---------------------------------------------------------------------------
+# The parent directory where per-batch folders are created.
+# Env: GEO_RING_BATCH_ROOT (used by the dashboard --batch-root argument)
+
+[batch]
+root = "F:\\GEO_Cloud_2024_batches"
+
+# ---------------------------------------------------------------------------
+# Download target disk
+# ---------------------------------------------------------------------------
+# The root directory for downloaded satellite data.
+# Env: GEO_RING_EXTERNAL_GEO_CLOUD_ROOT
+
+[download]
+target_root = "E:\\GEO_Cloud_2024"
+
+# ---------------------------------------------------------------------------
+# SSH upload target
+# ---------------------------------------------------------------------------
+# Env: GEO_RING_SSH_TARGET, GEO_RING_SSH_IDENTITY_FILE
+
+[ssh]
+target = "user@server.example.edu"
+identity_file = "~/.ssh/id_ed25519_server_automation"
+
+# ---------------------------------------------------------------------------
+# Server archive root
+# ---------------------------------------------------------------------------
+# The remote directory where uploaded files are stored.
+# Must be a dedicated child of an allowed parent directory.
+
+[server]
+archive_root = "/data04/1/user/geo_ring_cloud_auto_upload"
+allowed_parent = "/data04/1/user"
+
+# ---------------------------------------------------------------------------
+# EUMETSAT credentials
+# ---------------------------------------------------------------------------
+# Path to the EUMETSAT API credentials file.
+# Env: GEO_RING_EUMETSAT_CREDENTIALS_FILE
+
+[eumetsat]
+credentials_file = "config/eumetsat_credentials.txt"
+
+# ---------------------------------------------------------------------------
+# Download concurrency
+# ---------------------------------------------------------------------------
+
+[download.concurrency]
+inventory_workers = 8
+download_workers = 4
+max_workers = 16
+s3_range_mib = 4
+
+# ---------------------------------------------------------------------------
+# Upload concurrency
+# ---------------------------------------------------------------------------
+
+[upload.concurrency]
+max_upload_workers = 4
+server_verify_workers = 2
+connect_timeout_seconds = 20
+
+# ---------------------------------------------------------------------------
+# Email notification (SMTP)
+# ---------------------------------------------------------------------------
+# Optional.  If not configured, email notifications are disabled.
+
+[email]
+smtp_host = ""
+smtp_port = 587
+use_tls = true
+sender = ""
+recipient = ""
+# The password is stored encrypted via DPAPI, never in plaintext config.
+
+# ---------------------------------------------------------------------------
+# Network policy
+# ---------------------------------------------------------------------------
+
+[network]
+# When true, bypass all HTTP/SOCKS proxies and connect directly.
+direct_only = true
