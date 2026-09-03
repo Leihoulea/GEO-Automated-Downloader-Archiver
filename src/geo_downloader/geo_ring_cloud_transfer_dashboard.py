@@ -713,21 +713,19 @@ def process_is_running(pid: object) -> bool:
         numeric_pid = int(pid)
         if numeric_pid <= 0:
             return False
+    except (TypeError, ValueError):
+        return False
+    if os.name == "nt":
+        try:
+            import psutil  # type: ignore
+
+            return psutil.pid_exists(numeric_pid)
+        except (ImportError, OSError, ValueError):
+            return False
+    try:
         os.kill(numeric_pid, 0)
         return True
     except (OSError, SystemError):
-        # Windows may return access denied *or* ERROR_INVALID_PARAMETER for
-        # os.kill(pid, 0) even when the PID is healthy.  psutil's PID table
-        # query remains read-only and avoids falsely marking that task failed.
-        if os.name == "nt":
-            try:
-                import psutil  # type: ignore
-
-                return psutil.pid_exists(numeric_pid)
-            except (ImportError, OSError, ValueError):
-                return False
-        return False
-    except (TypeError, ValueError):
         return False
 
 
