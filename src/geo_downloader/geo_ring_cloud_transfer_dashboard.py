@@ -2191,6 +2191,8 @@ class DashboardState:
                 end_text,
                 "-CondaEnvironment",
                 self.conda_environment,
+                "-PythonExe",
+                sys.executable,
                 "-Platforms",
                 ",".join(platforms),
                 "-InventoryWorkers",

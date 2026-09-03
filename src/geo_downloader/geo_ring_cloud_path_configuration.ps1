@@ -3,7 +3,7 @@ $COMPONENT_ROLE = "path_configuration"
 $GeoRingProjectRoot = if ($env:GEO_RING_PROJECT_ROOT) {
     [System.IO.Path]::GetFullPath($env:GEO_RING_PROJECT_ROOT)
 } else {
-    [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\..\.."))
+    [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\.."))
 }
 
 $GeoRingThirdReportRoot = if ($env:GEO_RING_THIRD_REPORT_ROOT) {

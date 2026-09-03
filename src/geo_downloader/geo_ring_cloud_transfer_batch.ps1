@@ -6,6 +6,7 @@ param(
     [string]$StartDate = "2024-04-01",
     [string]$EndDate = "2024-04-01",
     [string]$CondaEnvironment = "pytorch",
+    [string]$PythonExe = "",
     [string]$Platforms = "GOES-16,GOES-18",
     [ValidateRange(1, 16)]
     [int]$InventoryWorkers = 8,
@@ -37,6 +38,13 @@ $StatusPath = Join-Path $TransferRoot "batch_status.json"
 $RunLog = Join-Path $TransferRoot "batch_run.log"
 $LockPath = Join-Path $TransferRoot "batch_run.lock"
 $CondaExe = $GeoRingCondaExe
+$ResolvedPythonExe = ""
+if (-not [string]::IsNullOrWhiteSpace($PythonExe)) {
+    $ResolvedPythonExe = [System.IO.Path]::GetFullPath($PythonExe)
+    if (-not (Test-Path -LiteralPath $ResolvedPythonExe -PathType Leaf)) {
+        throw "Python executable does not exist: $ResolvedPythonExe"
+    }
+}
 $AllowedPlatforms = @("GOES-16", "GOES-18", "Himawari-9", "Meteosat-0deg", "Meteosat-IODC")
 $SelectedPlatforms = @(
     $Platforms.Split(",") |
@@ -178,7 +186,11 @@ function Invoke-DownloadPython {
     $previousErrorActionPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = "Continue"
-        $commandOutput = & $CondaExe run -n $CondaEnvironment python @Arguments 2>&1
+        if ($ResolvedPythonExe) {
+            $commandOutput = & $ResolvedPythonExe @Arguments 2>&1
+        } else {
+            $commandOutput = & $CondaExe run -n $CondaEnvironment python @Arguments 2>&1
+        }
         $commandExitCode = $LASTEXITCODE
     }
     finally {
