@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,6 +15,20 @@ from .sources import REGISTRY_VERSION
 
 
 COMPONENT_ROLE = "lineage"
+
+
+def _hidden_subprocess_kwargs() -> dict:
+    """Return Windows-specific kwargs to hide console windows in subprocess calls."""
+    kwargs: dict = {}
+    if os.name == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        startupinfo = getattr(subprocess, "STARTUPINFO", None)
+        if startupinfo is not None:
+            si = startupinfo()
+            si.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
+            si.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+            kwargs["startupinfo"] = si
+    return kwargs
 
 
 def utc_now() -> str:
@@ -28,6 +43,7 @@ def code_commit(project_root: Path) -> str:
             capture_output=True,
             text=True,
             check=False,
+            **_hidden_subprocess_kwargs(),
         )
         return result.stdout.strip() if result.returncode == 0 else ""
     except OSError:
@@ -44,6 +60,7 @@ def _git_output(project_root: Path, args: list[str]) -> tuple[int, str]:
             encoding="utf-8",
             errors="replace",
             check=False,
+            **_hidden_subprocess_kwargs(),
         )
         # Git porcelain uses the first two columns as state. Preserve leading
         # spaces and remove line terminators only, otherwise `` M`` is
