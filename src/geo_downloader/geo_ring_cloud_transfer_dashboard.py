@@ -821,7 +821,7 @@ def download_launcher_status(
         else process_is_running(payload.get("pid"))
     )
     if (
-        payload.get("status") in {"STARTING", "RUNNING"}
+        payload.get("status") in {"STARTING", "RUNNING", "FAIL"}
         and not payload["process_alive"]
         and raw_batch_status.get("status") != "complete"
     ):
@@ -834,6 +834,8 @@ def download_launcher_status(
             payload["message"] = (
                 "启动器父进程已退出，但检测到下载临时文件仍在更新；按活动子下载显示运行中。"
             )
+        elif payload.get("status") == "FAIL":
+            pass
         else:
             payload["status"] = "FAIL"
             payload["message"] = (
