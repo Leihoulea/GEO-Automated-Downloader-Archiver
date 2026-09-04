@@ -476,9 +476,11 @@ def get_s3_client():
             signature_version=UNSIGNED,
             proxies={},
             connect_timeout=20,
-            read_timeout=45,
+            read_timeout=90,
             retries={"max_attempts": 3, "mode": "standard"},
             tcp_keepalive=True,
+            request_checksum_calculation="when_required",
+            response_checksum_validation="when_required",
         ),
     )
 
@@ -2048,7 +2050,14 @@ def download_s3_row(
                     Range=f"bytes={offset}-{range_end}",
                 )
                 body = response["Body"]
-                segment = body.read()
+                chunk = b""
+                while len(chunk) < (range_end - offset + 1):
+                    remaining = (range_end - offset + 1) - len(chunk)
+                    block = body.read(min(remaining, 1024 * 1024))
+                    if not block:
+                        break
+                    chunk += block
+                segment = chunk
                 required = range_end - offset + 1
                 if len(segment) != required:
                     raise RuntimeError(
