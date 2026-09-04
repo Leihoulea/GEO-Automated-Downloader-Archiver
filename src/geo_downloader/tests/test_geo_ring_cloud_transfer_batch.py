@@ -53,9 +53,61 @@ from geo_ring_cloud.notifications import (  # noqa: E402
     save_secure_email_config,
 )
 import geo_ring_cloud.notifications as notifications  # noqa: E402
+from geo_ring_cloud.heartbeat import (  # noqa: E402
+    write_heartbeat,
+    read_heartbeat,
+    should_heartbeat,
+    HEARTBEAT_INTERVAL_SECONDS,
+    HEARTBEAT_STALE_SECONDS,
+    DOWNLOAD_HEARTBEAT_NAME,
+    UPLOAD_HEARTBEAT_NAME,
+)
 
 
 class TransferBatchTests(unittest.TestCase):
+    def test_heartbeat_write_and_read_alive(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "transfer" / DOWNLOAD_HEARTBEAT_NAME
+            write_heartbeat(path, pid=12345, phase="downloading", completed=50, total=240)
+            result = read_heartbeat(path)
+            self.assertTrue(result["exists"])
+            self.assertTrue(result["alive"])
+            self.assertFalse(result["stale"])
+            self.assertEqual(result["pid"], 12345)
+            self.assertEqual(result["phase"], "downloading")
+            self.assertEqual(result["completed"], 50)
+            self.assertEqual(result["total"], 240)
+            self.assertIsNotNone(result["age_seconds"])
+            self.assertLess(result["age_seconds"], 2)
+
+    def test_heartbeat_stale_when_old(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "transfer" / UPLOAD_HEARTBEAT_NAME
+            write_heartbeat(path, pid=999, phase="uploading", completed=1, total=10)
+            # Manually backdate the timestamp
+            import json
+            data = json.loads(path.read_text(encoding="utf-8"))
+            data["timestamp_epoch"] = data["timestamp_epoch"] - (HEARTBEAT_STALE_SECONDS + 10)
+            path.write_text(json.dumps(data), encoding="utf-8")
+            result = read_heartbeat(path)
+            self.assertTrue(result["exists"])
+            self.assertFalse(result["alive"])
+            self.assertTrue(result["stale"])
+
+    def test_heartbeat_missing_returns_not_exists(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "transfer" / DOWNLOAD_HEARTBEAT_NAME
+            result = read_heartbeat(path)
+            self.assertFalse(result["exists"])
+            self.assertFalse(result["alive"])
+
+    def test_should_heartbeat_respects_interval(self):
+        self.assertTrue(should_heartbeat(0.0))
+        import time as _time
+        recent = _time.monotonic() - 1.0
+        self.assertFalse(should_heartbeat(recent))
+        old = _time.monotonic() - (HEARTBEAT_INTERVAL_SECONDS + 1)
+        self.assertTrue(should_heartbeat(old))
     def test_downloader_command_records_component_run_lineage(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             args = SimpleNamespace(root=temp_dir, command="validate")

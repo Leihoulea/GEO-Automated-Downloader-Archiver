@@ -47,6 +47,11 @@ from geo_ring_cloud.batch_queue import (  # noqa: E402
     semantic_key,
     write_json_atomic as write_queue_json_atomic,
 )
+from geo_ring_cloud.heartbeat import (  # noqa: E402
+    read_heartbeat,
+    DOWNLOAD_HEARTBEAT_NAME,
+    UPLOAD_HEARTBEAT_NAME,
+)
 
 from monitor_dashboard import (
     EPIC_DOWNLOAD_RE,
@@ -679,7 +684,13 @@ def auto_upload_status(transfer_dir: Path) -> Dict[str, object]:
     payload.setdefault("percent", 0)
     status = str(payload.get("status", "UNKNOWN")).upper()
     terminal_statuses = {"PASS", "FAIL", "FAILED", "STOPPED", "EXITED", "CANCELLED", "CANCELED"}
-    process_alive = False if status in terminal_statuses else process_is_running(payload.get("pid"))
+    upload_hb = read_heartbeat(transfer_dir / UPLOAD_HEARTBEAT_NAME)
+    if upload_hb["alive"]:
+        process_alive = True
+    elif status in terminal_statuses:
+        process_alive = False
+    else:
+        process_alive = process_is_running(payload.get("pid"))
     payload["process_alive"] = process_alive
     if status not in {"STARTING", "RUNNING"}:
         return payload
@@ -816,13 +827,16 @@ def download_launcher_status(
         or bool(payload.get("finished_at"))
         or payload.get("exit_code") is not None
     )
-    # A recorded terminal state is authoritative.  Probing only the numeric PID
-    # after completion can mistake a recycled Windows PID for the old launcher.
-    payload["process_alive"] = (
-        False
-        if has_terminal_record
-        else process_is_running(payload.get("pid"))
-    )
+    # Use heartbeat for liveness detection instead of PID probing.
+    # The heartbeat is written by the download process every 10 seconds;
+    # a fresh heartbeat means the process is alive regardless of PID.
+    heartbeat = read_heartbeat(transfer_dir / DOWNLOAD_HEARTBEAT_NAME)
+    if heartbeat["alive"]:
+        payload["process_alive"] = True
+    elif has_terminal_record:
+        payload["process_alive"] = False
+    else:
+        payload["process_alive"] = process_is_running(payload.get("pid"))
     # Reconcile from terminal artifacts: the downloader may have completed all
     # files and written download_summary.json, but the launcher parent (e.g.
     # PowerShell via conda run, or a command-line invocation) exited before

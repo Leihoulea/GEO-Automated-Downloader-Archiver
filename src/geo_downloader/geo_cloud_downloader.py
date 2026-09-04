@@ -32,6 +32,11 @@ if str(CORE_CODE_ROOT) not in sys.path:
 
 from geo_ring_cloud.lineage import write_manifest as write_lineage_manifest  # noqa: E402
 from geo_ring_cloud.paths import EXTERNAL_GEO_CLOUD_ROOT, PROJECT_ROOT  # noqa: E402
+from geo_ring_cloud.heartbeat import (
+    write_heartbeat,
+    should_heartbeat,
+    DOWNLOAD_HEARTBEAT_NAME,
+)  # noqa: E402
 
 
 COMPONENT_ROLE = "data_download_orchestrator"
@@ -379,6 +384,16 @@ def run_download_pool(
         )
 
     status("initial", 0)
+    heartbeat_path = root / "transfer" / DOWNLOAD_HEARTBEAT_NAME
+    last_heartbeat = 0.0
+    write_heartbeat(
+        heartbeat_path,
+        pid=os.getpid(),
+        phase="downloading",
+        completed=0,
+        total=len(pending),
+    )
+    last_heartbeat = time.monotonic()
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         active = {}
 
@@ -397,6 +412,15 @@ def run_download_pool(
         while active:
             done, _ = wait(tuple(active), timeout=1.0, return_when=FIRST_COMPLETED)
             if not done:
+                if should_heartbeat(last_heartbeat):
+                    write_heartbeat(
+                        heartbeat_path,
+                        pid=os.getpid(),
+                        phase="downloading",
+                        completed=completed_total,
+                        total=len(pending),
+                    )
+                    last_heartbeat = time.monotonic()
                 continue
             for future in done:
                 row = active.pop(future)
@@ -422,6 +446,16 @@ def run_download_pool(
                     f"{out.get('note')}\n"
                 )
                 log.flush()
+
+            if should_heartbeat(last_heartbeat):
+                write_heartbeat(
+                    heartbeat_path,
+                    pid=os.getpid(),
+                    phase="downloading",
+                    completed=completed_total,
+                    total=len(pending),
+                )
+                last_heartbeat = time.monotonic()
 
             elapsed = max(0.001, time.monotonic() - window_started)
             enough_samples = window_completed + window_failed >= max(2, target_workers * 2)
@@ -2333,6 +2367,13 @@ def run_download_s3_range(
     out_path = manifest_path(root, "manifest_downloaded.csv")
     write_csv(out_path, downloaded)
     run_validate(root)
+    write_heartbeat(
+        root / "transfer" / DOWNLOAD_HEARTBEAT_NAME,
+        pid=os.getpid(),
+        phase="downloaded",
+        completed=len(downloaded),
+        total=len(downloaded),
+    )
     return out_path
 
 

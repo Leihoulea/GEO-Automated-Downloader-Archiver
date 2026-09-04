@@ -29,6 +29,11 @@ if str(CORE_CODE_ROOT) not in sys.path:
 
 from geo_ring_cloud.lineage import code_commit, generating_script_state  # noqa: E402
 from geo_ring_cloud.paths import PROJECT_ROOT  # noqa: E402
+from geo_ring_cloud.heartbeat import (
+    write_heartbeat,
+    should_heartbeat,
+    UPLOAD_HEARTBEAT_NAME,
+)  # noqa: E402
 from geo_ring_cloud_transfer_batch import (
     PLATFORM_REMOTE_RELATIVE,
     iter_batch_files,
@@ -795,6 +800,15 @@ def watch_and_upload(
         status["updated_at"] = utc_now()
         try:
             write_json_atomic(status_path, status)
+            if should_heartbeat(getattr(update, "_last_hb", 0.0)):
+                write_heartbeat(
+                    status_path.parent / UPLOAD_HEARTBEAT_NAME,
+                    pid=os.getpid(),
+                    phase=str(status.get("phase", "")),
+                    completed=int(status.get("completed_files", 0) or 0),
+                    total=int(status.get("file_count", 0) or 0),
+                )
+                update._last_hb = time.monotonic()
             return True
         except OSError as exc:
             # Status must never be a single point of failure for data transfer.
@@ -1112,6 +1126,15 @@ def upload_batch(
         base_status["updated_at"] = utc_now()
         try:
             write_json_atomic(status_path, base_status)
+            if should_heartbeat(getattr(update, "_last_hb", 0.0)):
+                write_heartbeat(
+                    status_path.parent / UPLOAD_HEARTBEAT_NAME,
+                    pid=os.getpid(),
+                    phase=str(base_status.get("phase", "")),
+                    completed=int(base_status.get("completed_files", 0) or 0),
+                    total=int(base_status.get("file_count", 0) or 0),
+                )
+                update._last_hb = time.monotonic()
             return True
         except OSError as exc:
             base_status["status_write_failures"] = int(
