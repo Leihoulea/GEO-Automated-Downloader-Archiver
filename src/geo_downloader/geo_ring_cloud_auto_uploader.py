@@ -16,6 +16,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -41,6 +42,27 @@ RELATED_STAGE_IDS = ["stage_00"]
 DEFAULT_SERVER_ROOT = PurePosixPath("/data04/1/dhr/geo_ring_cloud_auto_upload")
 DEFAULT_ALLOWED_PARENT = PurePosixPath("/data04/1/dhr")
 MAX_UPLOAD_WORKERS = 4
+DEFAULT_UPLOAD_MAX_ATTEMPTS = 4
+DEFAULT_UPLOAD_RETRY_BASE_SECONDS = 5.0
+MAX_UPLOAD_ATTEMPTS = 10
+FAILURE_HISTORY_NAME = "auto_upload_failure_history.jsonl"
+
+FAILURE_LOG_LOCK = threading.Lock()
+
+
+class UploadFileFailure(RuntimeError):
+    """One manifest item exhausted its bounded upload attempts."""
+
+    def __init__(self, local_path: str, attempts: int, error: Exception) -> None:
+        super().__init__(
+            "{} failed after {} attempt(s): {}: {}".format(
+                local_path, attempts, type(error).__name__, error
+            )
+        )
+        self.local_path = local_path
+        self.attempts = attempts
+        self.retry_events = max(0, attempts - 1)
+        self.original_error = error
 
 
 def utc_now() -> str:
@@ -489,6 +511,107 @@ def upload_manifest_item(
     }
 
 
+def append_jsonl_durable(path: Path, row: Dict[str, object]) -> None:
+    """Append one small audit row and force it to stable storage."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    serialized = json.dumps(row, ensure_ascii=False) + "\n"
+    with FAILURE_LOG_LOCK:
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(serialized)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+
+def is_retryable_upload_error(exc: Exception) -> bool:
+    """Separate transient transport failures from unsafe permanent states."""
+    if isinstance(exc, (FileNotFoundError, ValueError)):
+        return False
+    message = "{}: {}".format(type(exc).__name__, exc).lower()
+    permanent_markers = (
+        "permission denied",
+        "authentication failed",
+        "host key verification failed",
+        "no such identity",
+        "identity file is missing",
+        "local source size changed",
+        "local source changed during upload",
+        "remote final file exists with unexpected size",
+        "remote .part file is larger than source",
+        "unsafe automatic upload root",
+        "unsafe directory",
+        "unsafe payload path",
+    )
+    return not any(marker in message for marker in permanent_markers)
+
+
+def upload_manifest_item_with_retry(
+    item: Dict[str, object],
+    remote_state: Dict[str, Optional[int]],
+    target: str,
+    identity_file: Path,
+    server_root: PurePosixPath,
+    allowed_parent: PurePosixPath,
+    connect_timeout: int,
+    max_attempts: int,
+    retry_base_seconds: float,
+    failure_history_path: Path,
+) -> Dict[str, object]:
+    """Upload one item with bounded retry and refreshed .part discovery."""
+    local_path = str(item["local_path"])
+    remote_path = str(item["remote_path"])
+    state = dict(remote_state)
+    last_error: Optional[Exception] = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            if attempt > 1:
+                state = inspect_remote(
+                    target,
+                    identity_file,
+                    server_root,
+                    allowed_parent,
+                    [remote_path],
+                    [str(PurePosixPath(remote_path).parent)],
+                    connect_timeout,
+                ).get(remote_path, {})
+            result = upload_manifest_item(
+                item,
+                state,
+                target,
+                identity_file,
+                connect_timeout,
+            )
+            result["attempts"] = attempt
+            result["retry_events"] = max(0, attempt - 1)
+            return result
+        except Exception as exc:
+            last_error = exc
+            retryable = is_retryable_upload_error(exc)
+            will_retry = retryable and attempt < max_attempts
+            delay = retry_base_seconds * (2 ** (attempt - 1)) if will_retry else 0.0
+            append_jsonl_durable(
+                failure_history_path,
+                {
+                    "recorded_at": utc_now(),
+                    "event": "file_upload_attempt_failed",
+                    "pid": os.getpid(),
+                    "local_path": local_path,
+                    "remote_path": remote_path,
+                    "attempt": attempt,
+                    "max_attempts": max_attempts,
+                    "retryable": retryable,
+                    "will_retry": will_retry,
+                    "retry_delay_seconds": delay,
+                    "error": "{}: {}".format(type(exc).__name__, exc),
+                    "automatic_delete": False,
+                },
+            )
+            if not will_retry:
+                break
+            time.sleep(delay)
+    assert last_error is not None
+    raise UploadFileFailure(local_path, attempt, last_error) from last_error
+
+
 def download_one(
     target: str,
     identity_file: Path,
@@ -619,6 +742,8 @@ def watch_and_upload(
     poll_seconds: int = 10,
     connect_timeout: int = 20,
     max_upload_workers: int = MAX_UPLOAD_WORKERS,
+    upload_max_attempts: int = DEFAULT_UPLOAD_MAX_ATTEMPTS,
+    upload_retry_base_seconds: float = DEFAULT_UPLOAD_RETRY_BASE_SECONDS,
 ) -> int:
     """Upload finalized files while the downloader continues, then reconcile fully."""
     batch_root = batch_root.resolve()
@@ -702,6 +827,8 @@ def watch_and_upload(
                 verification_report,
                 connect_timeout,
                 max_upload_workers,
+                upload_max_attempts,
+                upload_retry_base_seconds,
             )
 
         raw_batch = read_json_file(transfer_dir / "batch_status.json")
@@ -854,6 +981,8 @@ def upload_batch(
     verification_report: Path,
     connect_timeout: int = 20,
     max_upload_workers: int = MAX_UPLOAD_WORKERS,
+    upload_max_attempts: int = DEFAULT_UPLOAD_MAX_ATTEMPTS,
+    upload_retry_base_seconds: float = DEFAULT_UPLOAD_RETRY_BASE_SECONDS,
 ) -> int:
     validate_server_root(server_root, allowed_parent)
     ensure_tools_and_identity(identity_file)
@@ -861,6 +990,13 @@ def upload_batch(
         raise ValueError(
             "max_upload_workers must be between 1 and {}".format(MAX_UPLOAD_WORKERS)
         )
+    if not 1 <= upload_max_attempts <= MAX_UPLOAD_ATTEMPTS:
+        raise ValueError(
+            "upload_max_attempts must be between 1 and {}".format(MAX_UPLOAD_ATTEMPTS)
+        )
+    if upload_retry_base_seconds < 0:
+        raise ValueError("upload_retry_base_seconds must be non-negative")
+    failure_history_path = status_path.parent / FAILURE_HISTORY_NAME
     source = json.loads(manifest_path.resolve().read_text(encoding="utf-8"))
     source_files = list(source.get("files", []))
     source_total_bytes = sum(int(item.get("size_bytes", 0) or 0) for item in source_files)
@@ -1068,12 +1204,17 @@ def upload_batch(
             with ThreadPoolExecutor(max_workers=worker_count) as executor:
                 futures = {
                     executor.submit(
-                        upload_manifest_item,
+                        upload_manifest_item_with_retry,
                         item,
                         remote.get(str(item["remote_path"]), {}),
                         target,
                         identity_file,
+                        server_root,
+                        allowed_parent,
                         connect_timeout,
+                        upload_max_attempts,
+                        upload_retry_base_seconds,
+                        failure_history_path,
                     ): item
                     for item in wave
                 }
@@ -1222,6 +1363,22 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         choices=range(1, MAX_UPLOAD_WORKERS + 1),
         help="After download completion, ramp SFTP streams up to this value (1-4).",
     )
+    parser.add_argument(
+        "--upload-max-attempts",
+        type=int,
+        default=DEFAULT_UPLOAD_MAX_ATTEMPTS,
+        help="Bounded retry attempts per file (default: {}, max: {}).".format(
+            DEFAULT_UPLOAD_MAX_ATTEMPTS, MAX_UPLOAD_ATTEMPTS
+        ),
+    )
+    parser.add_argument(
+        "--upload-retry-base-seconds",
+        type=float,
+        default=DEFAULT_UPLOAD_RETRY_BASE_SECONDS,
+        help="Exponential backoff base seconds for upload retry (default: {}).".format(
+            DEFAULT_UPLOAD_RETRY_BASE_SECONDS
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -1258,6 +1415,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             args.poll_seconds,
             args.connect_timeout,
             args.max_upload_workers,
+            args.upload_max_attempts,
+            args.upload_retry_base_seconds,
         )
     return upload_batch(
         manifest_path,
@@ -1269,6 +1428,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         report_path,
         args.connect_timeout,
         args.max_upload_workers,
+        args.upload_max_attempts,
+        args.upload_retry_base_seconds,
     )
 
 
