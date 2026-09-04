@@ -40,6 +40,8 @@ CANCELLABLE_QUEUE_STATUSES = {
 # - Himawari-9: two completed May 2024 batches, 25.71--25.86 GiB/day.
 # - GOES-16/18: June 1--10 inventory, about 0.53/0.48 GiB/day.
 # - Meteosat: completed June 2024 transfer manifest, about 0.022 GiB/day each.
+# - DSCOVR EPIC L2 Cloud: March 2024 batch, 395 granules / 12.97 GiB over 31
+#   days, about 0.42 GiB/day (avg 33.6 MiB/granule, ~13 granules/day).
 #
 # The EUMETSAT catalogue ``size_bytes`` values describe catalogue records (for
 # example 565 bytes) rather than the delivered ZIP payloads (about 0.5 MiB), so
@@ -50,6 +52,7 @@ DEFAULT_RAW_GIB_PER_PLATFORM_DAY = {
     "Himawari-9": 26.0,
     "Meteosat-0deg": 0.025,
     "Meteosat-IODC": 0.025,
+    "DSCOVR-EPIC": 0.42,
 }
 DEFAULT_PLATFORM_SAFETY_FACTOR = {
     "GOES-16": 1.30,
@@ -57,6 +60,7 @@ DEFAULT_PLATFORM_SAFETY_FACTOR = {
     "Himawari-9": 1.20,
     "Meteosat-0deg": 1.30,
     "Meteosat-IODC": 1.30,
+    "DSCOVR-EPIC": 1.30,
 }
 DEFAULT_SAFETY_FACTOR = 1.20
 DEFAULT_FIXED_OVERHEAD_GIB = 2.0
@@ -161,6 +165,7 @@ def batch_name_for_request(request: Mapping[str, object]) -> str:
         "Himawari-9": "h9",
         "Meteosat-0deg": "m0",
         "Meteosat-IODC": "miodc",
+        "DSCOVR-EPIC": "epic",
     }
     start_date = date.fromisoformat(str(request["start_date"]))
     end_date = date.fromisoformat(str(request["end_date"]))

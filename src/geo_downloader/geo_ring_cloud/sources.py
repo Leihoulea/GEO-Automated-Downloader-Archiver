@@ -32,6 +32,11 @@ SOURCE_DEFINITIONS: tuple[SourceDefinition, ...] = (
     SourceDefinition("Meteosat-0deg", 5, "Meteosat", "METEOSAT-10", "EUMETSAT_OPERATIONAL_MSG", 0.0, ("CLM", "CTH"), 15, 15.0),
     SourceDefinition("Meteosat-IODC", 6, "Meteosat", "METEOSAT-IODC", "EUMETSAT_OPERATIONAL_MSG_IODC", 45.5, ("CLM", "CTH"), 15, 15.0),
     SourceDefinition("CLAAS3-0deg", 7, "CLAAS3", "METEOSAT-10", "CM_SAF_CLAAS_V003_ICDR", 0.0, ("CMA", "CTX", "CPP"), 15, 30.0),
+    # DSCOVR EPIC is a non-geostationary reference dataset imaged from the L1
+    # Lagrange point (not a GEO-ring source); it is kept as an independent
+    # validation reference and never enters the GEO-ring fusion tie order.
+    # service_longitude_deg is N/A for L1; 0.0 is a placeholder only.
+    SourceDefinition("DSCOVR-EPIC", 8, "DSCOVR", "DSCOVR", "NASA_EPIC_L2_CLOUD", 0.0, ("EPIC-L2-CLOUD",), 108, 90.0),
 )
 
 SOURCE_BY_KEY = {item.source_key: item for item in SOURCE_DEFINITIONS}

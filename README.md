@@ -1,7 +1,8 @@
 # GEO Automated Downloader & Archiver
 
 Automated download and archive tool for geostationary satellite cloud data
-(GOES-16/18, Himawari-9, Meteosat-0deg/IODC, FY4B).
+(GOES-16/18, Himawari-9, Meteosat-0deg/IODC, FY4B), with DSCOVR EPIC L2 Cloud
+as a non-geostationary reference dataset.
 
 This repository is an independent, standalone migration of the downloader
 component from the `AAAresearch_paper` project.

@@ -42,6 +42,7 @@ PLATFORM_REMOTE_RELATIVE = {
     "Meteosat-IODC": PurePosixPath("Meteosat-IODC"),
     "FY4B": PurePosixPath("FY4B"),
     "CMSAF": PurePosixPath("CM SAF"),
+    "DSCOVR-EPIC": PurePosixPath("DSCOVR-EPIC"),
 }
 
 

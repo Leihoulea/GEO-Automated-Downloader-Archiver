@@ -61,6 +61,11 @@ MET_DOWNLOAD_RE = re.compile(
     r"(?P<platform>Meteosat-\S+)\s+(?P<product>\S+)\s+"
     r"(?P<target>\S+)\s+(?P<note>.*)$"
 )
+EPIC_DOWNLOAD_RE = re.compile(
+    r"^(?P<ts>\S+)\s+(?P<num>\d+)/(?P<total>\d+)\s+(?P<status>\w+)\s+"
+    r"(?P<platform>DSCOVR-EPIC)\s+(?P<product>\S+)\s+"
+    r"(?P<target>\S+)\s+(?P<note>.*)$"
+)
 MET_INV_RE = re.compile(r"^(?P<ts>\S+)\s+inventoried_through=(?P<target>\S+)")
 
 

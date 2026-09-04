@@ -45,7 +45,7 @@ if (-not [string]::IsNullOrWhiteSpace($PythonExe)) {
         throw "Python executable does not exist: $ResolvedPythonExe"
     }
 }
-$AllowedPlatforms = @("GOES-16", "GOES-18", "Himawari-9", "Meteosat-0deg", "Meteosat-IODC")
+$AllowedPlatforms = @("GOES-16", "GOES-18", "Himawari-9", "Meteosat-0deg", "Meteosat-IODC", "DSCOVR-EPIC")
 $SelectedPlatforms = @(
     $Platforms.Split(",") |
         ForEach-Object { $_.Trim() } |
@@ -68,6 +68,7 @@ if ($SelectedPlatforms.Count -eq 0) {
 }
 $S3Platforms = @($SelectedPlatforms | Where-Object { $_.StartsWith("GOES-") -or $_ -eq "Himawari-9" })
 $MeteosatPlatforms = @($SelectedPlatforms | Where-Object { $_.StartsWith("Meteosat-") })
+$EpicPlatforms = @($SelectedPlatforms | Where-Object { $_ -eq "DSCOVR-EPIC" })
 
 $ScriptSha256 = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash.ToLowerInvariant()
 $ProjectPrefix = $GeoRingProjectRoot.TrimEnd("\") + "\"
@@ -234,6 +235,15 @@ function Read-EumetsatCredentials {
     $env:EUMETSAT_CONSUMER_SECRET = $secretMatch.Groups[1].Value.Trim()
 }
 
+function Assert-EarthdataCredentials {
+    if (-not $env:EARTHDATA_PASSWORD) {
+        throw "EARTHDATA_PASSWORD environment variable is required for DSCOVR EPIC downloads (NASA Earthdata Login)."
+    }
+    if (-not $env:EARTHDATA_USERNAME) {
+        $env:EARTHDATA_USERNAME = 'kingofkunlun'
+    }
+}
+
 New-Item -ItemType Directory -Force -Path $BatchRoot, $TransferRoot | Out-Null
 $env:PYTHONDONTWRITEBYTECODE = "1"
 $BatchLockStream = $null
@@ -266,6 +276,9 @@ try {
     Clear-DownloadProxy
     if ($MeteosatPlatforms.Count -gt 0) {
         Read-EumetsatCredentials
+    }
+    if ($EpicPlatforms.Count -gt 0) {
+        Assert-EarthdataCredentials
     }
 
     Write-BatchStatus -Phase "inventory" -Status "running" -Message "Daily parallel inventory; matching cache will be reused."
@@ -327,6 +340,24 @@ try {
         Invoke-DownloadPython -Arguments $MeteosatArguments
     }
 
+    if ($EpicPlatforms.Count -gt 0) {
+        Write-BatchStatus -Phase "epic_download" -Status "running"
+        $EpicWorkers = [Math]::Min($DownloadWorkers, 8)
+        $EpicArguments = @(
+            $Downloader, "--root", $BatchRoot, "download-epic-range",
+            "--start-date", $StartDate, "--end-date", $EndDate,
+            "--max-workers", $EpicWorkers.ToString()
+        )
+        if ($AdaptiveDownload) {
+            $EpicArguments += @(
+                "--adaptive-workers",
+                "--min-workers", ([Math]::Min($DownloadMinWorkers, $EpicWorkers)).ToString(),
+                "--initial-workers", ([Math]::Min($DownloadInitialWorkers, $EpicWorkers)).ToString()
+            )
+        }
+        Invoke-DownloadPython -Arguments $EpicArguments
+    }
+
     Clear-DownloadProxy
     Write-BatchStatus -Phase "manifest" -Status "running" -Message "Computing SHA-256 checksums."
     Invoke-DownloadPython -Arguments @(
@@ -343,6 +374,8 @@ catch {
 finally {
     Remove-Item Env:\EUMETSAT_CONSUMER_KEY -ErrorAction SilentlyContinue
     Remove-Item Env:\EUMETSAT_CONSUMER_SECRET -ErrorAction SilentlyContinue
+    Remove-Item Env:\EARTHDATA_PASSWORD -ErrorAction SilentlyContinue
+    Remove-Item Env:\EARTHDATA_USERNAME -ErrorAction SilentlyContinue
     if ($BatchLockStream) {
         $BatchLockStream.Dispose()
         Remove-Item -LiteralPath $LockPath -ErrorAction SilentlyContinue

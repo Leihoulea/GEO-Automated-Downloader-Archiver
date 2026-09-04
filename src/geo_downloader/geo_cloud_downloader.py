@@ -54,6 +54,10 @@ _EUMETSAT_BEARER_TOKEN: Optional[str] = None
 _EUMETSAT_TOKEN_LOCK = threading.Lock()
 INVENTORY_SCHEMA_VERSION = 2
 RELATED_STAGE_IDS = ("stage_00", "stage_00f")
+EPIC_CMR_URL = "https://cmr.earthdata.nasa.gov/search/granules.json"
+EPIC_CHUNK_SIZE = 1024 * 512
+EPIC_CMR_PAGE_SIZE = 2000
+MAX_EPIC_WORKERS = 8
 
 GOES_CONFIG = {
     "GOES-16": {
@@ -87,10 +91,26 @@ METEOSAT_CONFIG = {
     },
 }
 
+# DSCOVR EPIC L2 Cloud (NASA ASDC / LARC_CLOUD).  EPIC is a non-geostationary
+# reference dataset from the L1 Lagrange point; per the operation guide it is
+# kept in a separate batch and never mixed with the GEO-ring baseline.  The
+# inventory is driven by the CMR granule search API rather than a fixed URL
+# list, so any date range can be discovered automatically.
+EPIC_CONFIG = {
+    "platform": "DSCOVR-EPIC",
+    "service": "DSCOVR-EPIC",
+    "short_name": "DSCOVR_EPIC_L2_CLOUD",
+    "version": "03",
+    "collection_concept_id": "C2722461573-LARC_CLOUD",
+    "product": "EPIC-L2-CLOUD",
+    "bucket": "asdc-prod-protected",
+}
+
 PLATFORM_CHOICES = tuple(
     list(GOES_CONFIG)
     + [HIMAWARI_CONFIG["platform"]]
     + list(METEOSAT_CONFIG)
+    + [EPIC_CONFIG["platform"]]
 )
 
 MANIFEST_FIELDS = [
@@ -764,6 +784,30 @@ def get_eumdac_datastore():
     return eumdac.DataStore(token=token)
 
 
+def get_earthdata_credentials() -> tuple[str, str]:
+    username = os.environ.get("EARTHDATA_USERNAME", "kingofkunlun").strip()
+    password = os.environ.get("EARTHDATA_PASSWORD", "").strip()
+    if not password:
+        raise RuntimeError("EARTHDATA_PASSWORD is not set (NASA Earthdata Login)")
+    return username, password
+
+
+def get_earthdata_session():
+    """Return a requests.Session authenticated against NASA Earthdata URS.
+
+    NASA Earthdata Login uses HTTP Basic auth against ``urs.earthdata.nasa.gov``;
+    ``requests`` follows the OAuth redirect chain and retains the issued session
+    cookie in the jar, so subsequent granule downloads reuse the same auth.
+    """
+    import requests
+
+    username, password = get_earthdata_credentials()
+    session = requests.Session()
+    session.trust_env = False
+    session.auth = (username, password)
+    return session
+
+
 def get_eumetsat_bearer_token() -> str:
     global _EUMETSAT_BEARER_TOKEN
     if _EUMETSAT_BEARER_TOKEN:
@@ -1119,6 +1163,191 @@ def write_meteosat_inventory_summary(root: Path, rows: list[dict]) -> None:
     )
 
 
+def epic_cmr_search_granules(
+    start: datetime,
+    end: datetime,
+    page_size: int = EPIC_CMR_PAGE_SIZE,
+) -> list[dict]:
+    """Page through NASA CMR granule entries for the EPIC L2 Cloud collection.
+
+    CMR search is unauthenticated.  Each entry is the raw CMR ``feed.entry``
+    object; callers extract the title/time/size/URL via the helpers below.
+    """
+    import requests
+
+    entries: list[dict] = []
+    session = requests.Session()
+    session.trust_env = False
+    temporal = f"{start.strftime('%Y-%m-%dT%H:%M:%SZ')},{end.strftime('%Y-%m-%dT%H:%M:%SZ')}"
+    page_num = 1
+    last_error: Optional[str] = None
+    while True:
+        params = {
+            "concept_id": EPIC_CONFIG["collection_concept_id"],
+            "temporal": temporal,
+            "page_size": page_size,
+            "page_num": page_num,
+        }
+        for delay_index, delay in enumerate([0] + RETRY_DELAYS_SECONDS[:6]):
+            if delay:
+                time.sleep(delay)
+            try:
+                response = session.get(EPIC_CMR_URL, params=params, timeout=90)
+                response.raise_for_status()
+                payload = response.json()
+                page_entries = list(payload.get("feed", {}).get("entry") or [])
+                entries.extend(page_entries)
+                break
+            except Exception as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+                if delay_index == len(RETRY_DELAYS_SECONDS[:6]):
+                    raise RuntimeError(f"epic_cmr_search_failed: {last_error}") from exc
+        if len(page_entries) < page_size:
+            break
+        page_num += 1
+        if page_num > 200:
+            break
+    return entries
+
+
+def epic_granule_data_url(entry: dict) -> str:
+    for link in entry.get("links") or []:
+        rel = link.get("rel", "")
+        href = link.get("href", "")
+        if "data#" in rel and href.startswith("https://"):
+            return href
+    return ""
+
+
+def epic_granule_filename(entry: dict) -> str:
+    for key in ("producer_granule_id", "title"):
+        value = entry.get(key)
+        if value:
+            return str(value)
+    return ""
+
+
+def epic_granule_size_bytes(entry: dict) -> str:
+    size = entry.get("granule_size")
+    try:
+        return str(int(float(size) * 1_000_000))
+    except (TypeError, ValueError):
+        return ""
+
+
+def inventory_epic_range(
+    root: Path,
+    start_date: str,
+    end_date: str,
+) -> list[dict]:
+    """Inventory DSCOVR EPIC L2 Cloud granules for a date range via CMR.
+
+    Unlike the GEO platforms, EPIC has no fixed hourly cadence (the L1
+    imager acquires roughly every 108 minutes), so the manifest lists every
+    granule CMR reports in the range rather than targeting synthetic hourly
+    slots.  ``target_time_utc`` is the granule ``time_start``.
+    """
+    start = datetime.fromisoformat(start_date).replace(tzinfo=timezone.utc)
+    end_day = datetime.fromisoformat(end_date).replace(tzinfo=timezone.utc) + timedelta(days=1)
+    platform = EPIC_CONFIG["platform"]
+    service = EPIC_CONFIG["service"]
+    product = EPIC_CONFIG["product"]
+    collection_id = EPIC_CONFIG["collection_concept_id"]
+    bucket = EPIC_CONFIG["bucket"]
+    rows: list[dict] = []
+    try:
+        entries = epic_cmr_search_granules(start, end_day)
+        listing_error = ""
+    except Exception as exc:
+        entries = []
+        listing_error = f"{type(exc).__name__}: {exc}"
+
+    for entry in entries:
+        filename = epic_granule_filename(entry)
+        url = epic_granule_data_url(entry)
+        start_time = parse_iso_utc(entry["time_start"]) if entry.get("time_start") else None
+        end_time = parse_iso_utc(entry["time_end"]) if entry.get("time_end") else None
+        size = epic_granule_size_bytes(entry)
+        if not filename or not url or start_time is None:
+            note = f"skipped_incomplete_granule file={filename} url={bool(url)} time={bool(start_time)}"
+            rows.append(
+                base_row(
+                    start_time or start,
+                    platform,
+                    service,
+                    product,
+                    collection_id,
+                    "earthdata",
+                    bucket,
+                    url,
+                    start_time,
+                    end_time,
+                    size,
+                    "error",
+                    "",
+                    note,
+                )
+            )
+            continue
+        local_path = local_path_for(root, platform, product, start_time, filename)
+        rows.append(
+            base_row(
+                start_time,
+                platform,
+                service,
+                product,
+                collection_id,
+                "earthdata",
+                bucket,
+                url,
+                start_time,
+                end_time,
+                size,
+                "found",
+                local_path,
+                "cmr_granule_search",
+            )
+        )
+
+    if not rows and listing_error:
+        rows.append(
+            base_row(
+                start,
+                platform,
+                service,
+                product,
+                collection_id,
+                "earthdata",
+                bucket,
+                "",
+                None,
+                None,
+                "",
+                "error",
+                "",
+                listing_error,
+            )
+        )
+    return rows
+
+
+def write_epic_inventory_summary(root: Path, rows: list[dict]) -> None:
+    found = [row for row in rows if row["status"] == "found"]
+    total_size = sum(int(row["size_bytes"]) for row in found if str(row["size_bytes"]).isdigit())
+    summary = {
+        "created_at": utc_now(),
+        "rows": len(rows),
+        "found": len(found),
+        "missing": sum(1 for row in rows if row["status"] == "missing"),
+        "errors": sum(1 for row in rows if row["status"] == "error"),
+        "estimated_size_bytes": total_size,
+        "estimated_size_gib": round(total_size / (1024**3), 3),
+    }
+    manifest_path(root, "epic_inventory_summary.json").write_text(
+        json.dumps(summary, indent=2), encoding="utf-8"
+    )
+
+
 def run_download_meteosat_range(
     root: Path,
     start_date: str,
@@ -1236,6 +1465,116 @@ def write_meteosat_download_summary(root: Path, rows: list[dict]) -> None:
     manifest_path(root, "meteosat_download_summary.json").write_text(
         json.dumps(summary, indent=2), encoding="utf-8"
     )
+
+
+def write_epic_download_summary(root: Path, rows: list[dict]) -> None:
+    summary = {
+        "created_at": utc_now(),
+        "downloaded_rows": len(rows),
+        "ok_rows": sum(1 for row in rows if row["status"] == "downloaded"),
+        "corrupt_rows": sum(1 for row in rows if row["status"] == "corrupt"),
+    }
+    manifest_path(root, "epic_download_summary.json").write_text(
+        json.dumps(summary, indent=2), encoding="utf-8"
+    )
+
+
+def run_download_epic_range(
+    root: Path,
+    start_date: str,
+    end_date: str,
+    max_workers: int = 4,
+    adaptive_workers: bool = False,
+    min_workers: int = DEFAULT_ADAPTIVE_MIN_WORKERS,
+    initial_workers: int = DEFAULT_ADAPTIVE_INITIAL_WORKERS,
+) -> Path:
+    disable_proxy_environment()
+    max_workers = validate_worker_count(max_workers, MAX_EPIC_WORKERS, "max_workers")
+    inventory = manifest_path(root, "manifest_inventory.csv")
+    if not inventory.exists():
+        raise FileNotFoundError(f"Inventory not found: {inventory}")
+
+    start_prefix = f"{start_date}T"
+    end_dt = datetime.fromisoformat(end_date).replace(tzinfo=timezone.utc) + timedelta(days=1)
+    rows = []
+    for row in read_manifest(inventory):
+        if row["status"] != "found" or row["remote_type"] != "earthdata":
+            continue
+        if row.get("platform") != EPIC_CONFIG["platform"]:
+            continue
+        target_dt = parse_iso_utc(row["target_time_utc"])
+        if row["target_time_utc"] >= start_prefix and target_dt < end_dt:
+            rows.append(row)
+
+    skipped: list[dict] = []
+    pending: list[dict] = []
+    for row in rows:
+        local = Path(row["local_path"])
+        if local.exists():
+            if os.environ.get("GEO_CLOUD_FAST_SKIP_EXISTING", "").strip() == "1" and local.stat().st_size > 0:
+                ok, note = True, "fast_skip_existing_size_gt_0"
+            else:
+                ok, note = validate_file(local, row)
+            if ok:
+                out = dict(row)
+                out["status"] = "downloaded"
+                out["note"] = f"skipped_existing:{note}"
+                skipped.append(out)
+                continue
+        pending.append(row)
+
+    if pending:
+        get_earthdata_credentials()
+
+    ok_space, space = enough_free_space(root, pending)
+    space["total_rows"] = len(rows)
+    space["skipped_existing_rows"] = len(skipped)
+    space["pending_rows"] = len(pending)
+    manifest_path(root, "epic_space_check.json").write_text(json.dumps(space, indent=2), encoding="utf-8")
+    if not ok_space:
+        raise RuntimeError(f"Not enough free space: {space}")
+
+    downloaded: list[dict] = list(skipped)
+    thread_state = threading.local()
+    log_path = root / "logs" / "download_epic_range.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as log:
+        log.write(
+            f"{utc_now()} download_epic_range_start start={start_date} end={end_date} "
+            f"rows={len(rows)} skipped_existing={len(skipped)} pending={len(pending)} "
+            f"max_workers={max_workers} adaptive_workers={adaptive_workers} "
+            f"initial_workers={initial_workers} network_mode=direct_only\n"
+        )
+        log.flush()
+
+        def worker(row: dict) -> dict:
+            if not hasattr(thread_state, "session"):
+                thread_state.session = get_earthdata_session()
+            success, note = download_epic_row(thread_state.session, row)
+            out = dict(row)
+            out["status"] = "downloaded" if success else "corrupt"
+            out["note"] = note
+            return out
+
+        downloaded.extend(
+            run_download_pool(
+                root,
+                pending,
+                worker,
+                "earthdata",
+                max_workers,
+                adaptive_workers,
+                min_workers,
+                initial_workers,
+                log,
+            )
+        )
+
+    out_path = manifest_path(root, "manifest_epic_downloaded.csv")
+    write_csv(out_path, downloaded)
+    write_epic_download_summary(root, downloaded)
+    run_validate(root)
+    return out_path
 
 
 def inventory_meteosat(
@@ -1436,6 +1775,7 @@ def run_inventory(
     include_goes = bool(selected.intersection(GOES_CONFIG))
     include_himawari = HIMAWARI_CONFIG["platform"] in selected
     include_selected_meteosat = include_meteosat and bool(selected.intersection(METEOSAT_CONFIG))
+    include_epic = EPIC_CONFIG["platform"] in selected
     if bool(start_date) != bool(end_date):
         raise ValueError("start_date and end_date must be supplied together")
     if start_date and end_date:
@@ -1500,12 +1840,23 @@ def run_inventory(
                         )
                     )
 
+    if include_epic:
+        epic_start = days[0].strftime("%Y-%m-%d")
+        epic_end = days[-1].strftime("%Y-%m-%d")
+        jobs.append(
+            (
+                f"EPIC L2 Cloud {epic_start}..{epic_end}",
+                lambda s=epic_start, e=epic_end: inventory_epic_range(root, s, e),
+            )
+        )
+
     rows: list[dict] = []
     log_path = root / "logs" / "inventory.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("a", encoding="utf-8") as log:
         log.write(
             f"{utc_now()} inventory_start include_meteosat={include_selected_meteosat} "
+            f"include_epic={include_epic} "
             f"platforms={','.join(sorted(selected))} daily_jobs={len(jobs)} "
             f"inventory_workers={inventory_workers} network_mode=direct_only\n"
         )
@@ -1612,6 +1963,11 @@ def validate_file(path: Path, row: Optional[dict] = None) -> tuple[bool, str]:
                     return False, "cmsk_expected_mask_variable_not_detected"
                 if product == "CHGT" and not any(token in lowered for token in ["height", "hgt", "chgt"]):
                     return False, "chgt_expected_height_variable_not_detected"
+            if product == "EPIC-L2-CLOUD":
+                group_names = list(ds.groups.keys())
+                combined = lowered + " " + " ".join(name.lower() for name in group_names)
+                if not any(token in combined for token in ["cloud", "height", "geophysical", "geolocation"]):
+                    return False, "epic_expected_cloud_variables_not_detected"
         return True, "netcdf_ok"
     except Exception as exc:
         return False, f"netcdf_error={type(exc).__name__}: {exc}"
@@ -1785,6 +2141,53 @@ def download_eumetsat_row(datastore, row: dict) -> tuple[bool, str]:
     return False, "unreachable_retry_state"
 
 
+def download_epic_row(session, row: dict) -> tuple[bool, str]:
+    """Download one DSCOVR EPIC granule over HTTPS with Earthdata Login auth.
+
+    Mirrors the curl/netrc approach used by the legacy PowerShell orchestrator:
+    a ``requests.Session`` authenticated against URS follows the OAuth redirect
+    chain and streams the granule to a ``.part`` file that is atomically renamed
+    after NetCDF validation.
+    """
+    target = Path(row["local_path"])
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(target.name + ".part")
+    if target.exists():
+        ok, note = validate_file(target, row)
+        if ok:
+            return True, f"skipped_existing:{note}"
+    url = row["remote_key_or_product_id"]
+    for delay_index, delay in enumerate([0] + RETRY_DELAYS_SECONDS):
+        if delay:
+            time.sleep(delay)
+        try:
+            if tmp.exists():
+                tmp.unlink()
+            with session.get(url, stream=True, timeout=(20, 300), allow_redirects=True) as response:
+                if response.status_code == 401:
+                    response = session.get(url, stream=True, timeout=(20, 300), allow_redirects=True)
+                response.raise_for_status()
+                with tmp.open("wb") as dst:
+                    for chunk in response.iter_content(EPIC_CHUNK_SIZE):
+                        if chunk:
+                            dst.write(chunk)
+            ok, note = validate_file(tmp, row)
+            if not ok:
+                raise RuntimeError(note)
+            replace_with_retry(tmp, target)
+            return True, note
+        except Exception as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+            if delay_index == len(RETRY_DELAYS_SECONDS):
+                return False, last_error
+    return False, "unreachable_retry_state"
+
+
 def run_download_test_day(root: Path, test_day: str = TEST_DAY) -> Path:
     inventory = manifest_path(root, "manifest_inventory.csv")
     if not inventory.exists():
@@ -1797,6 +2200,7 @@ def run_download_test_day(root: Path, test_day: str = TEST_DAY) -> Path:
 
     s3_client = get_s3_client()
     datastore = get_eumdac_datastore() if any(row["remote_type"] == "eumetsat" for row in rows) else None
+    epic_session = get_earthdata_session() if any(row["remote_type"] == "earthdata" for row in rows) else None
     downloaded: list[dict] = []
     log_path = root / "logs" / "download_test_day.log"
     with log_path.open("a", encoding="utf-8") as log:
@@ -1804,6 +2208,8 @@ def run_download_test_day(root: Path, test_day: str = TEST_DAY) -> Path:
         for index, row in enumerate(rows, start=1):
             if row["remote_type"] == "s3":
                 success, note = download_s3_row(s3_client, row)
+            elif row["remote_type"] == "earthdata":
+                success, note = download_epic_row(epic_session, row)
             else:
                 success, note = download_eumetsat_row(datastore, row)
             out = dict(row)
@@ -2057,6 +2463,23 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="Limit downloads to one or more Meteosat services; repeat this option.",
     )
 
+    epic_download = sub.add_parser("download-epic-range", help="Download DSCOVR EPIC L2 Cloud rows from inventory.")
+    epic_download.add_argument("--start-date", required=True, help="UTC start date, YYYY-MM-DD.")
+    epic_download.add_argument("--end-date", required=True, help="UTC end date, YYYY-MM-DD.")
+    epic_download.add_argument(
+        "--max-workers",
+        type=int,
+        default=4,
+        help=f"Concurrent NASA Earthdata downloads (1-{MAX_EPIC_WORKERS}).",
+    )
+    epic_download.add_argument(
+        "--adaptive-workers",
+        action="store_true",
+        help="Start conservatively and tune concurrent downloads from measured results.",
+    )
+    epic_download.add_argument("--min-workers", type=int, default=DEFAULT_ADAPTIVE_MIN_WORKERS)
+    epic_download.add_argument("--initial-workers", type=int, default=DEFAULT_ADAPTIVE_INITIAL_WORKERS)
+
     first = sub.add_parser("first-round", help="Run inventory then test-day download.")
     first.add_argument("--date", default=TEST_DAY, help="UTC test day, YYYY-MM-DD.")
     return parser.parse_args(argv)
@@ -2153,6 +2576,17 @@ def main(argv: Optional[list[str]] = None) -> int:
                 args.start_date,
                 args.end_date,
                 set(args.platform) if args.platform else None,
+                args.max_workers,
+                args.adaptive_workers,
+                args.min_workers,
+                args.initial_workers,
+            )
+            print(out)
+        elif args.command == "download-epic-range":
+            out = run_download_epic_range(
+                root,
+                args.start_date,
+                args.end_date,
                 args.max_workers,
                 args.adaptive_workers,
                 args.min_workers,
