@@ -233,7 +233,7 @@
       </div>
       <div class="launch-actions">
         <div class="launch-note"><label><input id="refreshInventory" type="checkbox"> 强制刷新清单（通常不勾选，重复任务会复用缓存）</label><br><label><input id="adaptiveDownload" type="checkbox" checked> 下载自动调速：从 4 路开始，依据实际吞吐与错误率逐级升降（上限由上方选择）</label><br><label><input id="continuousUpload" type="checkbox" checked> 全自动流水线：下载时单路上传，下载结束后自动按 2→3→4 路提速，并执行服务器 SHA-256 全量复核</label><br>网络模式固定为 <b>direct_only</b>，任务不会自动删除本地文件。<span id="notificationStatus">邮件通知未配置</span>。CLAAS-3 是 CM SAF 订单型数据源，须先登录官方页面下单，不能在此处伪装成直接下载。</div>
-        <div><button class="button" id="configureEmailButton" type="button">配置邮件</button> <button class="button" id="testEmailButton" type="button" disabled>发送测试邮件</button> <button class="button" id="enqueueDownloadButton" type="button">加入空间感知队列</button> <button class="button primary" id="startDownloadButton" type="button">立即创建并启动</button></div>
+        <div class="launch-note" style="color:#666;padding:8px 0">ä¸è½½åä¸ä¼ è¯·ä½¿ç¨ scripts/ ç®å½ä¸çå½ä»¤è¡èæ¬å¯å¨ãä»ªè¡¨çä»ç¨äºæ¥çç¶æã</div><div><button class="button" id="configureEmailButton" type="button">配置邮件</button> <button class="button" id="testEmailButton" type="button" disabled>发送测试邮件</button> <button class="button" id="enqueueDownloadButton" type="button" hidden>加入空间感知队列</button> <button class="button primary" id="startDownloadButton" type="button" hidden>立即创建并启动</button></div>
       </div>
     </section>
 
@@ -243,7 +243,7 @@
         <div class="field" style="grid-column:span 3"><label for="fy4bSourcePath">FY4B 官方应用下载目录</label><input id="fy4bSourcePath" type="text" placeholder="粘贴官方应用的文件夹路径，例如 F:\\FY4B_official_download"></div>
         <div class="field" style="grid-column:span 2"><label for="fy4bBatchLabel">FY4B 自动批次标识</label><output id="fy4bBatchLabel">填写目录后自动生成</output></div>
       </div>
-      <div class="launch-actions"><div class="launch-note">仅接受 FY4B AGRI L2 官方命名的 <code>.NC</code> 文件，并从文件名校验变量、日期与小时；不符合规则的文件不会上传。请先点击“预览映射”。服务端路径固定为 <code>…/FY4B/变量/YYYYMMDD/HH/原始文件名</code>；上传器会在后台计算 SHA-256、断点续传和服务器复核，不会复制、移动或删除原始文件。</div><div><button class="button" id="previewFy4bUploadButton" type="button">预览 FY4B 映射</button> <button class="button primary" id="startFy4bUploadButton" type="button">创建 FY4B 上传批次</button></div></div>
+      <div class="launch-actions"><div class="launch-note">仅接受 FY4B AGRI L2 官方命名的 <code>.NC</code> 文件，并从文件名校验变量、日期与小时；不符合规则的文件不会上传。请先点击“预览映射”。服务端路径固定为 <code>…/FY4B/变量/YYYYMMDD/HH/原始文件名</code>；上传器会在后台计算 SHA-256、断点续传和服务器复核，不会复制、移动或删除原始文件。</div><div><button class="button" id="previewFy4bUploadButton" type="button">预览 FY4B 映射</button> <button class="button primary" id="startFy4bUploadButton" type="button" hidden>创建 FY4B 上传批次</button></div></div>
       <div class="fy4b-preview" id="fy4bPreviewPanel" hidden aria-live="polite">
         <div class="section-head"><h3>FY4B 映射预览</h3><div><button class="button" id="copyFy4bPreviewButton" type="button">复制路径</button> <button class="button" id="closeFy4bPreviewButton" type="button">关闭预览</button></div></div>
         <div class="fy4b-preview-grid" id="fy4bPreviewSummary"></div>
@@ -308,8 +308,8 @@
           <div class="path" id="autoUploadSpeed">上传速度：--</div>
           <div class="path" id="autoUploadParallelism">上传并行：等待任务</div>
           <div class="track"><div class="fill" id="autoUploadBar"></div></div>
-          <button class="button primary" id="continuousUploadButton" type="button" disabled style="margin-top:12px">接管当前下载并自动上传</button>
-          <button class="button" id="autoUploadButton" type="button" disabled style="margin-top:12px">完成后开始／续传上传</button>
+          <button class="button primary" id="continuousUploadButton" type="button" hidden style="margin-top:12px">接管当前下载并自动上传</button>
+          <button class="button" id="autoUploadButton" type="button" hidden style="margin-top:12px">完成后开始／续传上传</button>
         </div>
         <div class="gate">
           <div class="gate-title">人工 Xftp 备用 <span class="badge" id="xftpBadge">未确认</span></div>

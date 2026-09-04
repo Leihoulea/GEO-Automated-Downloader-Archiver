@@ -2779,15 +2779,23 @@ def make_handler(state: DashboardState):
 
         def do_POST(self) -> None:
             path = urlparse(self.path).path
+            disabled_actions = {
+                "/api/actions/start-download",
+                "/api/actions/enqueue-download",
+                "/api/actions/start-auto-upload",
+                "/api/actions/start-continuous-upload",
+                "/api/actions/start-fy4b-official-upload",
+            }
+            if path in disabled_actions:
+                self.send_json(
+                    {
+                        "ok": False,
+                        "error": "进程启动已禁用。请使用 scripts/ 下的命令行脚本启动下载和上传。",
+                    },
+                    403,
+                )
+                return
             try:
-                if path == "/api/actions/start-download":
-                    payload = self.read_json_body(required=True)
-                    self.send_json({"ok": True, "download": state.start_download(payload)})
-                    return
-                if path == "/api/actions/enqueue-download":
-                    payload = self.read_json_body(required=True)
-                    self.send_json({"ok": True, "queue_item": state.enqueue_download(payload)})
-                    return
                 if path == "/api/actions/cancel-queued-download":
                     payload = self.read_json_body(required=True)
                     self.send_json(
@@ -2799,43 +2807,12 @@ def make_handler(state: DashboardState):
                         }
                     )
                     return
-                if path == "/api/actions/start-auto-upload":
-                    payload = self.read_json_body()
-                    self.send_json(
-                        {
-                            "ok": True,
-                            "upload": state.start_auto_upload(
-                                str(payload.get("batch_name", ""))
-                            ),
-                        }
-                    )
-                    return
                 if path == "/api/actions/preview-fy4b-official-upload":
                     payload = self.read_json_body(required=True)
                     self.send_json(
                         {
                             "ok": True,
                             "preview": state.preview_fy4b_official_upload(payload),
-                        }
-                    )
-                    return
-                if path == "/api/actions/start-fy4b-official-upload":
-                    payload = self.read_json_body(required=True)
-                    self.send_json(
-                        {
-                            "ok": True,
-                            "fy4b": state.start_fy4b_official_upload(payload),
-                        }
-                    )
-                    return
-                if path == "/api/actions/start-continuous-upload":
-                    payload = self.read_json_body()
-                    self.send_json(
-                        {
-                            "ok": True,
-                            "upload": state.start_continuous_upload(
-                                str(payload.get("batch_name", ""))
-                            ),
                         }
                     )
                     return
