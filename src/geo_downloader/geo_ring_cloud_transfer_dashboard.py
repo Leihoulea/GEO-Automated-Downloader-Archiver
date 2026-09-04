@@ -49,6 +49,7 @@ from geo_ring_cloud.batch_queue import (  # noqa: E402
 )
 
 from monitor_dashboard import (
+    EPIC_DOWNLOAD_RE,
     MET_DOWNLOAD_RE,
     S3_EVENT_RE,
     format_bytes,
@@ -69,6 +70,7 @@ PLATFORM_NAMES = (
     "Meteosat-IODC",
     "FY4B",
     "CMSAF",
+    "DSCOVR-EPIC",
 )
 
 APP_ROOT = Path(__file__).resolve().parent
@@ -84,6 +86,7 @@ DOWNLOAD_PLATFORM_NAMES = (
     "Himawari-9",
     "Meteosat-0deg",
     "Meteosat-IODC",
+    "DSCOVR-EPIC",
 )
 FY4B_EXTERNAL_SOURCE = "FY4B 官方应用本地导入"
 FY4B_OFFICIAL_MAPPING_PROFILE = "fy4b_agri_l2_product_day_hour_v1"
@@ -820,6 +823,40 @@ def download_launcher_status(
         if has_terminal_record
         else process_is_running(payload.get("pid"))
     )
+    # Reconcile from terminal artifacts: the downloader may have completed all
+    # files and written download_summary.json, but the launcher parent (e.g.
+    # PowerShell via conda run, or a command-line invocation) exited before
+    # writing batch_status.json with status=complete.  Check the two
+    # independent terminal artifacts: download_summary.json and the transfer
+    # manifest.
+    summary = read_json(transfer_dir.parent / "manifests" / "download_summary.json")
+    downloaded_rows = int(summary.get("downloaded_rows", 0) or 0)
+    corrupt_rows = int(summary.get("corrupt_rows", 0) or 0)
+    missing_rows = int(summary.get("missing_rows", 0) or 0)
+    inventory_rows = int(summary.get("inventory_rows", 0) or 0)
+    locally_complete = (
+        downloaded_rows > 0
+        and corrupt_rows == 0
+        and missing_rows == 0
+        and (inventory_rows == 0 or downloaded_rows >= inventory_rows)
+    )
+    if locally_complete and not has_recent_download_part(transfer_dir):
+        changed = str(payload.get("status", "")).upper() != "COMPLETE"
+        payload.update(
+            {
+                "status": "COMPLETE",
+                "process_alive": False,
+                "finished_at": payload.get("finished_at") or utc_now_text(),
+                "updated_at": utc_now_text(),
+                "message": "本地可获取目标已全部下载，完整性审计和传输清单均已通过。",
+                "reconciliation_source": "download_summary_json",
+                "downloaded_rows": downloaded_rows,
+                "corrupt_rows": corrupt_rows,
+            }
+        )
+        if changed:
+            write_json_atomic(path, payload)
+        return payload
     if (
         payload.get("status") in {"STARTING", "RUNNING", "FAIL"}
         and not payload["process_alive"]
@@ -1793,6 +1830,7 @@ class DashboardState:
         s3_inventory_path = combined_inventory_path
         s3_inventory = read_inventory(s3_inventory_path, "s3")
         met_inventory = read_inventory(met_inventory_path, "eumetsat")
+        epic_inventory = read_inventory(combined_inventory_path, "earthdata")
         s3_download = summarize_download(
             log_dir / "download_s3_range.log",
             s3_inventory_path,
@@ -1805,11 +1843,20 @@ class DashboardState:
             MET_DOWNLOAD_RE,
             "download_meteosat_range_start",
         )
+        epic_download = summarize_download(
+            log_dir / "download_epic_range.log",
+            combined_inventory_path,
+            EPIC_DOWNLOAD_RE,
+            "download_epic_range_start",
+        )
         s3_completed_manifest = read_downloaded_manifest(
             manifest_dir / "manifest_downloaded.csv", "s3"
         )
         met_completed_manifest = read_downloaded_manifest(
             manifest_dir / "manifest_meteosat_downloaded.csv", "eumetsat"
+        )
+        epic_completed_manifest = read_downloaded_manifest(
+            manifest_dir / "manifest_epic_downloaded.csv", "earthdata"
         )
         parts = active_parts(batch_root)
         transfer = transfer_manifest_status(transfer_dir)
@@ -1821,19 +1868,26 @@ class DashboardState:
         cleanup = marker_status(transfer_dir / "local_cleanup_approval.json")
         s3_validation = read_json(manifest_dir / "download_summary.json")
         met_validation = read_json(manifest_dir / "meteosat_download_summary.json")
+        epic_validation = read_json(manifest_dir / "epic_download_summary.json")
         validation = {}
-        if s3_validation or met_validation:
+        if s3_validation or met_validation or epic_validation:
             validation = {
                 "corrupt_rows": int(s3_validation.get("corrupt_rows", 0))
-                + int(met_validation.get("corrupt_rows", 0)),
+                + int(met_validation.get("corrupt_rows", 0))
+                + int(epic_validation.get("corrupt_rows", 0)),
                 "downloaded_rows": int(s3_validation.get("downloaded_rows", 0))
-                + int(met_validation.get("downloaded_rows", 0)),
+                + int(met_validation.get("downloaded_rows", 0))
+                + int(epic_validation.get("downloaded_rows", 0)),
             }
-        inventory_total = int(s3_inventory.get("found", 0)) + int(
-            met_inventory.get("found", 0)
+        inventory_total = (
+            int(s3_inventory.get("found", 0))
+            + int(met_inventory.get("found", 0))
+            + int(epic_inventory.get("found", 0))
         )
-        started_total = int(s3_download.get("total", 0)) + int(
-            met_download.get("total", 0)
+        started_total = (
+            int(s3_download.get("total", 0))
+            + int(met_download.get("total", 0))
+            + int(epic_download.get("total", 0))
         )
         s3_completed = (
             int(s3_completed_manifest.get("completed", 0))
@@ -1845,7 +1899,12 @@ class DashboardState:
             if met_completed_manifest.get("exists")
             else int(met_download.get("overall_completed", 0))
         )
-        completed = s3_completed + met_completed
+        epic_completed = (
+            int(epic_completed_manifest.get("completed", 0))
+            if epic_completed_manifest.get("exists")
+            else int(epic_download.get("overall_completed", 0))
+        )
+        completed = s3_completed + met_completed + epic_completed
         total = max(inventory_total, started_total, completed)
         combined_download = {
             "total": total,
@@ -1853,16 +1912,24 @@ class DashboardState:
             "started_total": started_total,
             "overall_completed": completed,
             "remaining": max(total - completed, 0),
-            "failed": int(s3_download.get("failed", 0)) + int(met_download.get("failed", 0)),
+            "failed": (
+                int(s3_download.get("failed", 0))
+                + int(met_download.get("failed", 0))
+                + int(epic_download.get("failed", 0))
+            ),
             "scope": "full_inventory" if inventory_total else "started_downloads",
         }
         combined_download["percent"] = round(completed / total * 100, 2) if total else 0
         recent = sorted(
-            list(s3_download.get("recent", [])) + list(met_download.get("recent", [])),
+            list(s3_download.get("recent", []))
+            + list(met_download.get("recent", []))
+            + list(epic_download.get("recent", [])),
             key=lambda row: row.get("ts", ""),
         )[-12:]
         platform_found = merge_platform_counts(
-            s3_inventory.get("by_platform", {}), met_inventory.get("by_platform", {})
+            s3_inventory.get("by_platform", {}),
+            met_inventory.get("by_platform", {}),
+            epic_inventory.get("by_platform", {}),
         )
         platform_done = merge_platform_counts(
             s3_completed_manifest.get("by_platform", {})
@@ -1871,6 +1938,9 @@ class DashboardState:
             met_completed_manifest.get("by_platform", {})
             if met_completed_manifest.get("exists")
             else met_download.get("by_platform", {}),
+            epic_completed_manifest.get("by_platform", {})
+            if epic_completed_manifest.get("exists")
+            else epic_download.get("by_platform", {}),
         )
         raw_batch_status = read_json(transfer_dir / "batch_status.json")
         launcher = download_launcher_status(transfer_dir, raw_batch_status)
@@ -1898,7 +1968,9 @@ class DashboardState:
             combined_download["completion_state"] = "running"
             combined_download["completion_message"] = "下载仍在进行。"
         stages = build_pipeline_stages(
-            int(s3_inventory.get("found", 0)) + int(met_inventory.get("found", 0)),
+            int(s3_inventory.get("found", 0))
+            + int(met_inventory.get("found", 0))
+            + int(epic_inventory.get("found", 0)),
             combined_download,
             parts,
             validation,
@@ -1995,11 +2067,12 @@ class DashboardState:
             "disk_gate": disk_gate,
             "tasks": tasks,
             "batch_queue": self.batch_queue_status(),
-            "inventory": {"s3": s3_inventory, "meteosat": met_inventory},
+            "inventory": {"s3": s3_inventory, "meteosat": met_inventory, "epic": epic_inventory},
             "download": {
                 "combined": combined_download,
                 "s3": s3_download,
                 "meteosat": met_download,
+                "epic": epic_download,
                 "recent": recent,
                 "parallelism": download_parallelism,
             },
@@ -2116,6 +2189,7 @@ class DashboardState:
                 "Himawari-9": "h9",
                 "Meteosat-0deg": "m0",
                 "Meteosat-IODC": "miodc",
+                "DSCOVR-EPIC": "epic",
             }
             batch_name = "{}_{}_{}".format(
                 start_date.strftime("%Y%m%d"),
