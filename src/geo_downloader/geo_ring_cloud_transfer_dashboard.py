@@ -860,12 +860,10 @@ def download_launcher_status(
     if (
         payload.get("status") in {"STARTING", "RUNNING", "FAIL"}
         and not payload["process_alive"]
-        and raw_batch_status.get("status") != "complete"
+        and raw_batch_status.get("status") not in {"complete", "failed"}
     ):
         previous_message = str(payload.get("message", "")).strip()
-        if raw_batch_status.get("status") == "running" and has_recent_download_part(
-            transfer_dir
-        ):
+        if has_recent_download_part(transfer_dir):
             payload["status"] = "RUNNING"
             payload["detached_child_activity"] = True
             payload["message"] = (
@@ -879,6 +877,16 @@ def download_launcher_status(
                 "下载启动进程已经退出，但批次没有生成完成状态。"
                 + (" 上次记录：{}".format(previous_message) if previous_message else "")
             )
+    elif (
+        payload.get("status") in {"STARTING", "RUNNING", "FAIL"}
+        and raw_batch_status.get("status") == "failed"
+        and has_recent_download_part(transfer_dir)
+    ):
+        payload["status"] = "RUNNING"
+        payload["detached_child_activity"] = True
+        payload["message"] = (
+            "批次状态为失败，但检测到下载临时文件仍在更新；按活动子下载显示运行中。"
+        )
     return payload
 
 
@@ -1374,7 +1382,7 @@ class DashboardState:
         download_status = str(launcher.get("status", "UNKNOWN"))
         if raw.get("status") == "complete":
             download_status = "COMPLETE"
-        elif raw.get("status") == "failed":
+        elif raw.get("status") == "failed" and launcher.get("status") not in {"RUNNING", "COMPLETE"}:
             download_status = "FAIL"
         upload_status = str(upload.get("status", "PENDING"))
         if xftp.get("payload", {}).get("status") == "AUTOMATED_SFTP_COMPLETE":
