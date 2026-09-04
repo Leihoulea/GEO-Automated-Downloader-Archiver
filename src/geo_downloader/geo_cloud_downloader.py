@@ -824,7 +824,26 @@ def get_earthdata_credentials() -> tuple[str, str]:
     username = os.environ.get("EARTHDATA_USERNAME", "kingofkunlun").strip()
     password = os.environ.get("EARTHDATA_PASSWORD", "").strip()
     if not password:
-        raise RuntimeError("EARTHDATA_PASSWORD is not set (NASA Earthdata Login)")
+        cred_file = os.environ.get(
+            "GEO_RING_EARTHDATA_CREDENTIALS_FILE",
+            str(Path(__file__).resolve().parents[2] / "config" / "earthdata_credentials.txt"),
+        )
+        p = Path(cred_file)
+        if p.is_file():
+            import re
+            text = p.read_text(encoding="utf-8", errors="replace")
+            user_match = re.search(r"(?im)^\s*username\s*[:=]\s*(\S+)\s*$", text)
+            pass_match = re.search(r"(?im)^\s*password\s*[:=]\s*(\S+)\s*$", text)
+            if pass_match:
+                password = pass_match.group(1).strip()
+                if user_match:
+                    username = user_match.group(1).strip()
+    if not password:
+        raise RuntimeError(
+            "EARTHDATA_PASSWORD is not set (NASA Earthdata Login). "
+            "Set the environment variable or create config/earthdata_credentials.txt "
+            "with 'username:' and 'password:' lines."
+        )
     return username, password
 
 

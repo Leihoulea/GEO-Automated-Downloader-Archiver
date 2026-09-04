@@ -60,6 +60,12 @@ $GeoRingEumetsatCredentialsFile = if ($env:GEO_RING_EUMETSAT_CREDENTIALS_FILE) {
     Join-Path $GeoRingProjectRoot "config\eumetsat_credentials.txt"
 }
 
+$GeoRingEarthdataCredentialsFile = if ($env:GEO_RING_EARTHDATA_CREDENTIALS_FILE) {
+    [System.IO.Path]::GetFullPath($env:GEO_RING_EARTHDATA_CREDENTIALS_FILE)
+} else {
+    Join-Path $GeoRingProjectRoot "config\earthdata_credentials.txt"
+}
+
 $GeoRingPythonExe = if ($env:GEO_RING_PYTHON_EXE) {
     [System.IO.Path]::GetFullPath($env:GEO_RING_PYTHON_EXE)
 } else {

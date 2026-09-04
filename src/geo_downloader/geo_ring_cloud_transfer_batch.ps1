@@ -235,11 +235,25 @@ function Read-EumetsatCredentials {
     $env:EUMETSAT_CONSUMER_SECRET = $secretMatch.Groups[1].Value.Trim()
 }
 
-function Assert-EarthdataCredentials {
-    if (-not $env:EARTHDATA_PASSWORD) {
-        throw "EARTHDATA_PASSWORD environment variable is required for DSCOVR EPIC downloads (NASA Earthdata Login)."
+function Read-EarthdataCredentials {
+    if ($env:EARTHDATA_PASSWORD) {
+        if (-not $env:EARTHDATA_USERNAME) { $env:EARTHDATA_USERNAME = 'kingofkunlun' }
+        return
     }
-    if (-not $env:EARTHDATA_USERNAME) {
+    $CredentialFile = $GeoRingEarthdataCredentialsFile
+    if (-not (Test-Path -LiteralPath $CredentialFile)) {
+        throw "EARTHDATA_PASSWORD not set and credential file not found: $CredentialFile. Either set the environment variable or create the file with 'username:' and 'password:' lines."
+    }
+    $text = Get-Content -LiteralPath $CredentialFile -Raw
+    $userMatch = [regex]::Match($text, '(?im)^\s*username\s*[:=]\s*(\S+)\s*$')
+    $passMatch = [regex]::Match($text, '(?im)^\s*password\s*[:=]\s*(\S+)\s*$')
+    if (-not $passMatch.Success) {
+        throw "Could not parse username/password from Earthdata credential file: $CredentialFile"
+    }
+    $env:EARTHDATA_PASSWORD = $passMatch.Groups[1].Value.Trim()
+    if ($userMatch.Success) {
+        $env:EARTHDATA_USERNAME = $userMatch.Groups[1].Value.Trim()
+    } else {
         $env:EARTHDATA_USERNAME = 'kingofkunlun'
     }
 }
@@ -278,7 +292,7 @@ try {
         Read-EumetsatCredentials
     }
     if ($EpicPlatforms.Count -gt 0) {
-        Assert-EarthdataCredentials
+        Read-EarthdataCredentials
     }
 
     Write-BatchStatus -Phase "inventory" -Status "running" -Message "Daily parallel inventory; matching cache will be reused."
