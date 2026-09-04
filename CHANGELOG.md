@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.0-rc2] - 2026-09-04
+
+### Fixed
+- **SSH timeout and stdin DEVNULL** (from b0c14b86): `run_ssh` now sets
+  `stdin=subprocess.DEVNULL` when no input is provided, preventing SSH from
+  blocking on an unusable Session-0 stdin handle in S4U scheduled tasks.
+  Added `command_timeout` parameter; connection check uses
+  `max(30, connect_timeout + 10)` so the "true" probe cannot hang forever.
+- **Bounded upload retry** (from fc58f258): individual file uploads now
+  retry up to 4 times (max 10) with exponential backoff (base 5s, 2^n).
+  `is_retryable_upload_error` distinguishes transient failures (retry)
+  from permanent failures (skip). Failure audit log written to
+  `auto_upload_failure_history.jsonl` with fsync for durability.
+  Added `--upload-max-attempts` and `--upload-retry-base-seconds` CLI args.
+- **Download completion reconciliation** (from a7e70177 concept):
+  `download_launcher_status` now checks `download_summary.json` for terminal
+  completion signals before checking for failure. If all files downloaded,
+  0 corrupt, 0 missing, and no active .part files, status is set to
+  COMPLETE with `reconciliation_source=download_summary_json`.
+
 ## [0.1.0-rc1] - 2026-09-04
 
 ### Added
