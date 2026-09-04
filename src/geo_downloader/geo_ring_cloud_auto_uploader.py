@@ -286,16 +286,32 @@ def run_ssh(
     connect_timeout: int,
     input_text: Optional[str] = None,
     check: bool = True,
+    command_timeout: Optional[int] = None,
 ) -> subprocess.CompletedProcess:
-    result = subprocess.run(
-        ssh_base(target, identity_file, connect_timeout) + [command],
-        input=input_text,
-        text=True,
-        capture_output=True,
-        check=False,
-        creationflags=subprocess_creation_flags(),
-        startupinfo=subprocess_startupinfo(),
-    )
+    run_kwargs: Dict[str, object] = {
+        "text": True,
+        "capture_output": True,
+        "check": False,
+        "creationflags": subprocess_creation_flags(),
+        "startupinfo": subprocess_startupinfo(),
+    }
+    if input_text is None:
+        run_kwargs["stdin"] = subprocess.DEVNULL
+    else:
+        run_kwargs["input"] = input_text
+    if command_timeout is not None:
+        run_kwargs["timeout"] = command_timeout
+    try:
+        result = subprocess.run(
+            ssh_base(target, identity_file, connect_timeout) + [command],
+            **run_kwargs,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            "SSH command timed out after {} seconds: {}".format(
+                command_timeout, command
+            )
+        ) from exc
     if check and result.returncode != 0:
         message = (result.stderr or result.stdout or "SSH command failed").strip()
         raise RuntimeError(message)
@@ -982,7 +998,13 @@ def upload_batch(
             active_workers=1,
             parallelism_reason="checking_ssh_connection",
         )
-        run_ssh(target, identity_file, "true", connect_timeout)
+        run_ssh(
+            target,
+            identity_file,
+            "true",
+            connect_timeout,
+            command_timeout=max(30, connect_timeout + 10),
+        )
         remote_paths = [str(item["remote_path"]) for item in files]
         directories = sorted(
             {str(PurePosixPath(path).parent) for path in remote_paths}
