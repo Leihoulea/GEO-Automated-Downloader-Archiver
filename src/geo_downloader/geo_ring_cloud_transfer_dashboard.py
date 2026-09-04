@@ -1392,6 +1392,9 @@ class DashboardState:
         server = server_verification_status(transfer_dir)
         xftp = marker_status(transfer_dir / "xftp_upload_complete.json")
         error = str(launcher.get("message") or raw.get("message") or upload.get("error") or "")
+        # Suppress stale error messages when the launcher has reconciled to RUNNING
+        if launcher.get("detached_child_activity") and launcher.get("status") == "RUNNING":
+            error = ""
         disk_gate = enrich_disk_gate(parse_disk_gate(error), batch_root)
         download_status = str(launcher.get("status", "UNKNOWN"))
         if raw.get("status") == "complete":

@@ -377,7 +377,13 @@
     }
     function renderTasks(tasks){
       if(!tasks?.length){ $("taskList").innerHTML='<div class="empty">尚未发现批次目录</div>'; return; }
-      $("taskList").innerHTML=tasks.map(task=>{
+      const all=tasks || [];
+      const isDone=t=>t.server_status==='PASS' || (t.upload_status==='PASS' && t.download_status==='COMPLETE');
+      const isFailed=t=>['FAIL','FAILED'].includes(t.download_status) && !isDone(t);
+      const active=all.filter(t=>!isDone(t) && !isFailed(t));
+      const done=all.filter(isDone);
+      const failed=all.filter(isFailed);
+      const renderRow=task=>{
         const selected=task.batch_name===selectedBatchName;
         const gate=task.disk_gate?.exists
           ? task.disk_gate.currently_passes
@@ -391,7 +397,12 @@
           <span class="task-kpi"><b>${esc(taskStatus(task.upload_status))} ${task.upload_file_count?`· ${pct(task.upload_percent)}`:''}</b><span>上传 ${nf.format(task.upload_completed_files || 0)} / ${nf.format(task.upload_file_count || 0)}</span></span>
           <span class="task-kpi"><b>${esc(taskStatus(task.server_status))}</b><span>服务器复核</span></span>
         </button>`;
-      }).join('');
+      };
+      $('taskList').innerHTML=active.length ? active.map(renderRow).join('') : '<div class="empty">没有活动或待处理任务；已完成和失败批次在下方折叠。</div>';
+      let html='';
+      if(failed.length){ html+=`<details class="task-archive" style="margin-top:14px"><summary style="cursor:pointer;padding:10px 0;color:var(--muted);font-weight:700">失败批次（${nf.format(failed.length)}）</summary><div class="task-list">${failed.map(renderRow).join('')}</div></details>`; }
+      if(done.length){ html+=`<details class="task-archive" style="margin-top:14px"><summary style="cursor:pointer;padding:10px 0;color:var(--muted);font-weight:700">已完成批次（${nf.format(done.length)}，默认折叠）</summary><div class="task-list">${done.map(renderRow).join('')}</div></details>`; }
+      $('taskList').innerHTML+=html;
       document.querySelectorAll('.task-item').forEach(node=>node.addEventListener('click',()=>{
         selectedBatchName=node.dataset.batch || '';
         const url=new URL(location.href); url.searchParams.set('batch_name',selectedBatchName); history.replaceState({},'',url);

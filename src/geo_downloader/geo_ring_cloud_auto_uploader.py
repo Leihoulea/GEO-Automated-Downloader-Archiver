@@ -845,6 +845,47 @@ def watch_and_upload(
                 upload_retry_base_seconds,
             )
 
+        # If no transfer manifest exists but download_summary.json indicates
+        # all files are downloaded, generate the manifest automatically.
+        # This handles the case where the downloader was started from the
+        # command line (not via PS1 orchestrator), so nobody called
+        # transfer_batch.py prepare to write the manifest.
+        summary = read_json_file(transfer_dir.parent / "manifests" / "download_summary.json")
+        dl_rows = int(summary.get("downloaded_rows", 0) or 0)
+        corrupt = int(summary.get("corrupt_rows", 0) or 0)
+        missing = int(summary.get("missing_rows", 0) or 0)
+        inv_rows = int(summary.get("inventory_rows", 0) or 0)
+        if (
+            dl_rows > 0
+            and corrupt == 0
+            and missing == 0
+            and (inv_rows == 0 or dl_rows >= inv_rows)
+        ):
+            from geo_ring_cloud_transfer_batch import prepare_manifest
+            update(
+                phase="preparing_manifest",
+                current_file="",
+                parallelism_reason="download_complete_generating_manifest",
+            )
+            try:
+                prepare_manifest(
+                    batch_root,
+                    output_dir=transfer_dir,
+                    server_root=server_root,
+                    start_date=start_date,
+                    end_date=end_date,
+                    platforms=set(platforms),
+                )
+            except Exception as exc:
+                update(
+                    phase="manifest_failed",
+                    error="{}: {}".format(type(exc).__name__, exc),
+                )
+                time.sleep(max(2, poll_seconds))
+                continue
+            # Loop back to pick up the freshly created manifest
+            continue
+
         raw_batch = read_json_file(transfer_dir / "batch_status.json")
         launcher = read_json_file(transfer_dir / "download_launcher_status.json")
         launcher_active = str(launcher.get("status", "")).upper() in {"STARTING", "RUNNING"}
