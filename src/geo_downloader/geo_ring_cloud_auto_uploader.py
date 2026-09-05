@@ -858,8 +858,7 @@ def watch_and_upload(
         if (
             dl_rows > 0
             and corrupt == 0
-            and missing == 0
-            and (inv_rows == 0 or dl_rows >= inv_rows)
+            and (inv_rows == 0 or dl_rows + missing >= inv_rows)
         ):
             from geo_ring_cloud_transfer_batch import prepare_manifest
             update(

@@ -848,11 +848,14 @@ def download_launcher_status(
     corrupt_rows = int(summary.get("corrupt_rows", 0) or 0)
     missing_rows = int(summary.get("missing_rows", 0) or 0)
     inventory_rows = int(summary.get("inventory_rows", 0) or 0)
+    # "missing" in download_summary means rows where inventory status != "found"
+    # — these are remote-unavailable files (e.g. S3 404, EUMETSAT 503), not
+    # local download failures.  The batch is locally complete when all
+    # available files are downloaded with zero corruption and no active .part.
     locally_complete = (
         downloaded_rows > 0
         and corrupt_rows == 0
-        and missing_rows == 0
-        and (inventory_rows == 0 or downloaded_rows >= inventory_rows)
+        and (inventory_rows == 0 or downloaded_rows + missing_rows >= inventory_rows)
     )
     if locally_complete and not has_recent_download_part(transfer_dir):
         changed = str(payload.get("status", "")).upper() != "COMPLETE"
@@ -862,7 +865,14 @@ def download_launcher_status(
                 "process_alive": False,
                 "finished_at": payload.get("finished_at") or utc_now_text(),
                 "updated_at": utc_now_text(),
-                "message": "本地可获取目标已全部下载，完整性审计和传输清单均已通过。",
+                "message": (
+                    "本地可获取目标已全部下载，完整性审计和传输清单均已通过。"
+                    + (
+                        " 远端不可用 {} 个文件已跳过。".format(missing_rows)
+                        if missing_rows > 0
+                        else ""
+                    )
+                ),
                 "reconciliation_source": "download_summary_json",
                 "downloaded_rows": downloaded_rows,
                 "corrupt_rows": corrupt_rows,
