@@ -858,7 +858,6 @@ def get_earthdata_session():
 
     username, password = get_earthdata_credentials()
     session = requests.Session()
-    session.trust_env = False
     session.auth = (username, password)
     return session
 

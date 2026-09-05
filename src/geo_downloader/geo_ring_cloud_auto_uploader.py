@@ -1351,6 +1351,7 @@ def upload_batch(
             verify_command,
             connect_timeout,
             check=False,
+            command_timeout=3600,
         )
         download_one(
             target,
