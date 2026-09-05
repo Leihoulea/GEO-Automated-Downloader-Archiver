@@ -2003,7 +2003,10 @@ def validate_file(path: Path, row: Optional[dict] = None) -> tuple[bool, str]:
 
         with Dataset(path, "r") as ds:
             names = list(ds.variables.keys())
-            if not names:
+            group_names = list(ds.groups.keys()) if hasattr(ds, 'groups') else []
+            # EPIC L2 Cloud stores all data in groups, not root variables.
+            # Check groups before declaring no_variables.
+            if not names and not group_names:
                 return False, "no_variables"
             product = (row or {}).get("product", "")
             lowered = " ".join(name.lower() for name in names)
@@ -2018,7 +2021,6 @@ def validate_file(path: Path, row: Optional[dict] = None) -> tuple[bool, str]:
                 if product == "CHGT" and not any(token in lowered for token in ["height", "hgt", "chgt"]):
                     return False, "chgt_expected_height_variable_not_detected"
             if product == "EPIC-L2-CLOUD":
-                group_names = list(ds.groups.keys())
                 combined = lowered + " " + " ".join(name.lower() for name in group_names)
                 if not any(token in combined for token in ["cloud", "height", "geophysical", "geolocation"]):
                     return False, "epic_expected_cloud_variables_not_detected"
