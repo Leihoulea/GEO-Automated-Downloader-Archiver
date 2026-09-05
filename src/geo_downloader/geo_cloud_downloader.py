@@ -2400,15 +2400,18 @@ def run_download_s3_range(
 def run_validate(root: Path) -> None:
     inventory_path = manifest_path(root, "manifest_inventory.csv")
     downloaded_path = manifest_path(root, "manifest_downloaded.csv")
+    epic_downloaded_path = manifest_path(root, "manifest_epic_downloaded.csv")
     inventory_rows = read_manifest(inventory_path) if inventory_path.exists() else []
     downloaded_rows = read_manifest(downloaded_path) if downloaded_path.exists() else []
+    epic_downloaded_rows = read_manifest(epic_downloaded_path) if epic_downloaded_path.exists() else []
+    all_downloaded = downloaded_rows + epic_downloaded_rows
 
     missing_rows = [row for row in inventory_rows if row["status"] != "found"]
     corrupt_rows: list[dict] = []
     seen: dict[str, dict] = {}
     duplicate_rows: list[dict] = []
 
-    for row in downloaded_rows:
+    for row in all_downloaded:
         local_path = row.get("local_path", "")
         if not local_path:
             corrupt_rows.append({**row, "note": "no_local_path"})
@@ -2429,7 +2432,7 @@ def run_validate(root: Path) -> None:
     summary = {
         "created_at": utc_now(),
         "inventory_rows": len(inventory_rows),
-        "downloaded_rows": len(downloaded_rows),
+        "downloaded_rows": len(all_downloaded),
         "missing_rows": len(missing_rows),
         "corrupt_rows": len(corrupt_rows),
         "duplicate_rows": len(duplicate_rows),
