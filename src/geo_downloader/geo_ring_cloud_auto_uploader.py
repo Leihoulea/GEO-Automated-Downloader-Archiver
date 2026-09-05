@@ -855,11 +855,12 @@ def watch_and_upload(
         corrupt = int(summary.get("corrupt_rows", 0) or 0)
         missing = int(summary.get("missing_rows", 0) or 0)
         inv_rows = int(summary.get("inventory_rows", 0) or 0)
-        if (
+        download_complete = (
             dl_rows > 0
             and corrupt == 0
             and (inv_rows == 0 or dl_rows + missing >= inv_rows)
-        ):
+        )
+        if download_complete:
             from geo_ring_cloud_transfer_batch import prepare_manifest
             update(
                 phase="preparing_manifest",
@@ -888,12 +889,7 @@ def watch_and_upload(
         raw_batch = read_json_file(transfer_dir / "batch_status.json")
         launcher = read_json_file(transfer_dir / "download_launcher_status.json")
         launcher_active = str(launcher.get("status", "")).upper() in {"STARTING", "RUNNING"}
-        # If download_summary indicates completion (checked above), skip the
-        # batch_status=failed check — the PS1 orchestrator may write "failed"
-        # when some remote files are unavailable, but download_summary.json is
-        # the authoritative terminal artifact.
-        if not download_complete:
-            if raw_batch.get("status") == "failed" and not launcher_active:
+        if raw_batch.get("status") == "failed" and not launcher_active:
                 update(
                     status="FAIL",
                     phase="download_failed",
