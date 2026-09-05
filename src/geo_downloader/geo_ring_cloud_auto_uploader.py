@@ -888,15 +888,20 @@ def watch_and_upload(
         raw_batch = read_json_file(transfer_dir / "batch_status.json")
         launcher = read_json_file(transfer_dir / "download_launcher_status.json")
         launcher_active = str(launcher.get("status", "")).upper() in {"STARTING", "RUNNING"}
-        if raw_batch.get("status") == "failed" and not launcher_active:
-            update(
-                status="FAIL",
-                phase="download_failed",
-                failed_at=utc_now(),
-                error=str(raw_batch.get("message") or "下载失败，持续上传已停止。"),
-                current_file="",
-            )
-            return 2
+        # If download_summary indicates completion (checked above), skip the
+        # batch_status=failed check — the PS1 orchestrator may write "failed"
+        # when some remote files are unavailable, but download_summary.json is
+        # the authoritative terminal artifact.
+        if not download_complete:
+            if raw_batch.get("status") == "failed" and not launcher_active:
+                update(
+                    status="FAIL",
+                    phase="download_failed",
+                    failed_at=utc_now(),
+                    error=str(raw_batch.get("message") or "下载失败，持续上传已停止。"),
+                    current_file="",
+                )
+                return 2
 
         discovered = discover_completed_files(batch_root, start_date, end_date, platforms)
         current_paths = {str(path) for _, path, _ in discovered}
