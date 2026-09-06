@@ -68,12 +68,28 @@ GOES_CONFIG = {
     "GOES-16": {
         "bucket": "noaa-goes16",
         "service": "GOES-16",
-        "short_products": {"ABI-L2-ACMF": "ACMF", "ABI-L2-ACHAF": "ACHAF"},
+        "short_products": {
+            "ABI-L2-ACMF": "ACMF",
+            "ABI-L2-ACHAF": "ACHAF",
+            "ABI-L2-ACTPF": "ACTPF",
+            "ABI-L2-CTPF": "CTPF",
+            "ABI-L2-ACHTF": "ACHTF",
+            "ABI-L2-CODF": "CODF",
+            "ABI-L2-CPSF": "CPSF",
+        },
     },
     "GOES-18": {
         "bucket": "noaa-goes18",
         "service": "GOES-18",
-        "short_products": {"ABI-L2-ACMF": "ACMF", "ABI-L2-ACHAF": "ACHAF"},
+        "short_products": {
+            "ABI-L2-ACMF": "ACMF",
+            "ABI-L2-ACHAF": "ACHAF",
+            "ABI-L2-ACTPF": "ACTPF",
+            "ABI-L2-CTPF": "CTPF",
+            "ABI-L2-ACHTF": "ACHTF",
+            "ABI-L2-CODF": "CODF",
+            "ABI-L2-CPSF": "CPSF",
+        },
     },
 }
 
@@ -89,10 +105,20 @@ METEOSAT_CONFIG = {
     "Meteosat-0deg": {
         "EO:EUM:DAT:MSG:CLM": "CLM",
         "EO:EUM:DAT:MSG:CTH": "CTH",
+        "EO:EUM:DAT:MSG:CTTH": "CTTH",
+        "EO:EUM:DAT:MSG:CT": "CT",
+        "EO:EUM:DAT:MSG:OCA": "OCA",
+        "EO:EUM:DAT:MSG:CMIC": "CMIC",
+        "EO:EUM:DAT:MSG:CLA": "CLA",
     },
     "Meteosat-IODC": {
         "EO:EUM:DAT:MSG:CLM-IODC": "CLM",
         "EO:EUM:DAT:MSG:CTH-IODC": "CTH",
+        "EO:EUM:DAT:MSG:CTTH-IODC": "CTTH",
+        "EO:EUM:DAT:MSG:CT-IODC": "CT",
+        "EO:EUM:DAT:MSG:OCA-IODC": "OCA",
+        "EO:EUM:DAT:MSG:CMIC-IODC": "CMIC",
+        "EO:EUM:DAT:MSG:CLA-IODC": "CLA",
     },
 }
 
@@ -2014,12 +2040,22 @@ def validate_file(path: Path, row: Optional[dict] = None) -> tuple[bool, str]:
                 return False, "acmf_expected_cloud_mask_variable_not_detected"
             if product == "ACHAF" and not any(token in lowered for token in ["height", "ht", "acha"]):
                 return False, "achaf_expected_height_variable_not_detected"
+            # GOES full-disk products: ACTPF, CTPF, ACHTF, CODF, CPSF
+            # These use the same ABI naming; accept any non-empty variable set.
+            if product in {"ACTPF", "CTPF", "ACHTF", "CODF", "CPSF"}:
+                pass  # validated by non-empty names check above
             if product in {"CMSK", "CHGT"}:
                 log_variable_table(path, names)
                 if product == "CMSK" and not any(token in lowered for token in ["mask", "cloud", "cmsk"]):
                     return False, "cmsk_expected_mask_variable_not_detected"
                 if product == "CHGT" and not any(token in lowered for token in ["height", "hgt", "chgt"]):
                     return False, "chgt_expected_height_variable_not_detected"
+            # Meteosat products: CLM, CTH, CTTH, CT, OCA, CMIC, CLA
+            # These are EUMETSAT ZIP files; the zip check above already validated structure.
+            # NetCDF4 check is for non-ZIP formats; EUMETSAT products pass through here
+            # only if they happen to be NetCDF. Accept any non-empty variable/group set.
+            if product in {"CLM", "CTH", "CTTH", "CT", "OCA", "CMIC", "CLA"}:
+                pass
             if product == "EPIC-L2-CLOUD":
                 combined = lowered + " " + " ".join(name.lower() for name in group_names)
                 if not any(token in combined for token in ["cloud", "height", "geophysical", "geolocation"]):

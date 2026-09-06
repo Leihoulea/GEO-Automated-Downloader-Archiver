@@ -809,7 +809,7 @@ class TransferBatchTests(unittest.TestCase):
         estimate = estimate_required_space(request)
         self.assertEqual(estimate["days"], 30)
         self.assertEqual(estimate["basis"], "adaptive_platform_product_v2")
-        self.assertAlmostEqual(estimate["required_gib"], 939.95, places=2)
+        self.assertAlmostEqual(estimate["required_gib"], 944.24, places=2)
         self.assertEqual(estimate["fixed_overhead_gib"], 2.0)
         self.assertEqual(estimate["platform_safety_factor"]["Himawari-9"], 1.2)
         self.assertEqual(estimate["platform_safety_factor"]["Meteosat-0deg"], 1.3)
@@ -828,8 +828,8 @@ class TransferBatchTests(unittest.TestCase):
             ["GOES-16", "GOES-18"],
         )
         estimate = estimate_required_space(request)
-        self.assertAlmostEqual(estimate["raw_gib"], 11.5, places=2)
-        self.assertAlmostEqual(estimate["required_gib"], 16.95, places=2)
+        self.assertAlmostEqual(estimate["raw_gib"], 38.0, places=2)
+        self.assertAlmostEqual(estimate["required_gib"], 51.4, places=2)
 
     def test_s3_inventory_refines_estimate_but_eumetsat_metadata_does_not(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -857,7 +857,7 @@ class TransferBatchTests(unittest.TestCase):
             )
             self.assertEqual(refined["basis"], "trusted_inventory_pending_bytes_v2")
             self.assertEqual(refined["inventory_authoritative_platforms"], ["GOES-16"])
-            self.assertAlmostEqual(refined["required_gib"], 3.332, places=3)
+            self.assertAlmostEqual(refined["required_gib"], 3.404, places=3)
             self.assertEqual(
                 refined["platform_estimates"]["Meteosat-0deg"]["estimate_source"]
                 if "estimate_source" in refined["platform_estimates"]["Meteosat-0deg"]
@@ -898,7 +898,7 @@ class TransferBatchTests(unittest.TestCase):
                 dashboard.process_batch_queue_once()
             refreshed = read_queue_state(dashboard.queue_state_path)["items"][0]
             self.assertEqual(refreshed["estimate"]["basis"], "adaptive_platform_product_v2")
-            self.assertAlmostEqual(refreshed["estimate"]["required_gib"], 16.95, places=2)
+            self.assertAlmostEqual(refreshed["estimate"]["required_gib"], 51.4, places=2)
 
     def test_batch_queue_waits_for_active_download_without_creating_target(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1324,7 +1324,7 @@ class TransferBatchTests(unittest.TestCase):
             rows = geo_cloud_downloader.inventory_goes(
                 Path("batch"), object(), target, {"GOES-16"}
             )
-        self.assertEqual(len(rows), 2)
+        self.assertEqual(len(rows), 7)
         self.assertEqual({row["platform"] for row in rows}, {"GOES-16"})
 
     def test_goes_daily_inventory_lists_remote_prefix_once(self):

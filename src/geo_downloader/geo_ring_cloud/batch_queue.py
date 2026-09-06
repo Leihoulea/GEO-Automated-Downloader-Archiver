@@ -47,11 +47,11 @@ CANCELLABLE_QUEUE_STATUSES = {
 # example 565 bytes) rather than the delivered ZIP payloads (about 0.5 MiB), so
 # they must not be treated as authoritative byte estimates.
 DEFAULT_RAW_GIB_PER_PLATFORM_DAY = {
-    "GOES-16": 0.60,
-    "GOES-18": 0.55,
+    "GOES-16": 2.0,  # expanded: ACMF, ACHAF, ACTPF, CTPF, ACHTF, CODF, CPSF
+    "GOES-18": 1.8,
     "Himawari-9": 26.0,
-    "Meteosat-0deg": 0.025,
-    "Meteosat-IODC": 0.025,
+    "Meteosat-0deg": 0.08,  # expanded: CLM, CTH, CTTH, CT, OCA, CMIC, CLA
+    "Meteosat-IODC": 0.08,
     "DSCOVR-EPIC": 0.42,
 }
 DEFAULT_PLATFORM_SAFETY_FACTOR = {
