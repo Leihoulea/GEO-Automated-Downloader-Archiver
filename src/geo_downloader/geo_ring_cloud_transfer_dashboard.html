@@ -375,9 +375,13 @@
     function taskStatus(value){
       return ({STARTING:'启动中',RUNNING:'进行中',COMPLETE:'已完成',PASS:'已完成',FAIL:'失败',STOPPED:'已停止',STALLED:'疑似卡住',failed:'失败',PENDING:'等待',UNKNOWN:'未知'})[value] || value || '等待';
     }
+    let _taskArchiveOpen = {failed: false, done: false};
     function renderTasks(tasks){
       if(!tasks?.length){ $("taskList").innerHTML='<div class="empty">尚未发现批次目录</div>'; return; }
-      const all=tasks || [];
+      document.querySelectorAll('.task-archive').forEach(d => {
+        if (d.dataset.archiveKey) _taskArchiveOpen[d.dataset.archiveKey] = d.open;
+      });
+      const all=(tasks || []).slice().sort((a,b) => (b.batch_name||'').localeCompare(a.batch_name||''));
       const isDone=t=>t.server_status==='PASS' || (t.upload_status==='PASS' && t.download_status==='COMPLETE');
       const isFailed=t=>['FAIL','FAILED'].includes(t.download_status) && !isDone(t);
       const active=all.filter(t=>!isDone(t) && !isFailed(t));
@@ -400,8 +404,8 @@
       };
       $('taskList').innerHTML=active.length ? active.map(renderRow).join('') : '<div class="empty">没有活动或待处理任务；已完成和失败批次在下方折叠。</div>';
       let html='';
-      if(failed.length){ html+=`<details class="task-archive" style="margin-top:14px"><summary style="cursor:pointer;padding:10px 0;color:var(--muted);font-weight:700">失败批次（${nf.format(failed.length)}）</summary><div class="task-list">${failed.map(renderRow).join('')}</div></details>`; }
-      if(done.length){ html+=`<details class="task-archive" style="margin-top:14px"><summary style="cursor:pointer;padding:10px 0;color:var(--muted);font-weight:700">已完成批次（${nf.format(done.length)}，默认折叠）</summary><div class="task-list">${done.map(renderRow).join('')}</div></details>`; }
+      if(failed.length){ html+=`<details class="task-archive" data-archive-key="failed" style="margin-top:14px"${_taskArchiveOpen.failed?' open':''}><summary style="cursor:pointer;padding:10px 0;color:var(--muted);font-weight:700">失败批次（${nf.format(failed.length)}）</summary><div class="task-list">${failed.map(renderRow).join('')}</div></details>`; }
+      if(done.length){ html+=`<details class="task-archive" data-archive-key="done" style="margin-top:14px"${_taskArchiveOpen.done?' open':''}><summary style="cursor:pointer;padding:10px 0;color:var(--muted);font-weight:700">已完成批次（${nf.format(done.length)}，默认折叠）</summary><div class="task-list">${done.map(renderRow).join('')}</div></details>`; }
       $('taskList').innerHTML+=html;
       document.querySelectorAll('.task-item').forEach(node=>node.addEventListener('click',()=>{
         selectedBatchName=node.dataset.batch || '';
