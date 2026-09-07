@@ -231,6 +231,28 @@ def disable_proxy_environment() -> None:
     os.environ["no_proxy"] = "*"
 
 
+def get_excluded_products() -> dict[str, set[str]]:
+    """Parse GEO_RING_EXCLUDED_PRODUCTS env var into per-platform exclusion sets.
+
+    Format: "GOES-16:ACHAF;Meteosat-0deg:CTH,CTTH"
+    Returns: {"GOES-16": {"ACHAF"}, "Meteosat-0deg": {"CTH", "CTTH"}}
+    """
+    raw = os.environ.get("GEO_RING_EXCLUDED_PRODUCTS", "").strip()
+    if not raw:
+        return {}
+    result: dict[str, set[str]] = {}
+    for pair in raw.split(";"):
+        pair = pair.strip()
+        if ":" not in pair:
+            continue
+        platform, products = pair.split(":", 1)
+        platform = platform.strip()
+        product_set = {p.strip() for p in products.split(",") if p.strip()}
+        if platform and product_set:
+            result.setdefault(platform, set()).update(product_set)
+    return result
+
+
 def inventory_request(
     kind: str,
     start_date: str,
@@ -1448,11 +1470,14 @@ def run_download_meteosat_range(
 
     start_prefix = f"{start_date}T"
     end_dt = datetime.fromisoformat(end_date).replace(tzinfo=timezone.utc) + timedelta(days=1)
+    excluded = get_excluded_products()
     rows = []
     for row in read_manifest(inventory):
         if row["status"] != "found" or row["remote_type"] != "eumetsat":
             continue
         if platforms is not None and row.get("platform") not in platforms:
+            continue
+        if row.get("platform") in excluded and row.get("product") in excluded[row["platform"]]:
             continue
         target_dt = parse_iso_utc(row["target_time_utc"])
         if row["target_time_utc"] >= start_prefix and target_dt < end_dt:
@@ -2344,11 +2369,14 @@ def run_download_s3_range(
 
     start_prefix = f"{start_date}T"
     end_dt = datetime.fromisoformat(end_date).replace(tzinfo=timezone.utc) + timedelta(days=1)
+    excluded = get_excluded_products()
     rows = []
     for row in read_manifest(inventory):
         if row["status"] != "found" or row["remote_type"] != "s3":
             continue
         if platforms is not None and row.get("platform") not in platforms:
+            continue
+        if row.get("platform") in excluded and row.get("product") in excluded[row["platform"]]:
             continue
         target_dt = parse_iso_utc(row["target_time_utc"])
         if row["target_time_utc"] >= start_prefix and target_dt < end_dt:

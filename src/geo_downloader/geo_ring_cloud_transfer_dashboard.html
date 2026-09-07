@@ -226,6 +226,8 @@
         <label class="platform-choice"><input type="checkbox" value="Meteosat-0deg">Meteosat 0°</label>
         <label class="platform-choice"><input type="checkbox" value="Meteosat-IODC">Meteosat IODC</label>
         <label class="platform-choice" title="DSCOVR EPIC L2 Cloud（NASA ASDC）为独立参考数据集，需设置 EARTHDATA_PASSWORD 环境变量；建议单独批次，不与 GEO-ring 混批。"><input type="checkbox" value="DSCOVR-EPIC">DSCOVR EPIC L2 Cloud</label>
+      </div>
+      <div id="productSelector" style="margin:10px 0;display:none"></div>
         <span class="platform-choice" title="CM SAF 要求注册并登录后提交订单，不能与匿名对象存储使用同一种直下载流程。">
           <input type="checkbox" value="CLAAS3-0deg" disabled>CLAAS-3（CMA/CTX/CPP）· 需先下单
         </span>
@@ -679,9 +681,36 @@
       toast(permission==='granted'?'电脑通知已开启':'未获得通知权限，可在浏览器网站设置中修改');
     });
     $("testEmailButton").addEventListener('click',async()=>{ try{const data=await postAction('/api/actions/send-test-email');toast(`测试邮件已发送到 ${data.email?.recipient || '已配置地址'}`);}catch(error){toast(error.message);} });
+    const PLATFORM_PRODUCTS={
+      'GOES-16':['ACMF','ACHAF','ACTPF','CTPF','ACHTF','CODF','CPSF'],
+      'GOES-18':['ACMF','ACHAF','ACTPF','CTPF','ACHTF','CODF','CPSF'],
+      'Himawari-9':['CMSK','CHGT'],
+      'Meteosat-0deg':['CLM','CTH','CTTH','CT','OCA','CMIC','CLA'],
+      'Meteosat-IODC':['CLM','CTH','CTTH','CT','OCA','CMIC','CLA'],
+      'DSCOVR-EPIC':['EPIC-L2-CLOUD'],
+    };
+    function renderProductSelector(){
+      const selected=[...document.querySelectorAll('#platformChoices input:checked')].map(n=>n.value);
+      const container=$('productSelector');
+      if(!selected.length){container.style.display='none';return;}
+      let html='<div style="font-size:12px;color:var(--muted);margin-bottom:6px">产品/变量选择（不勾选则下载该平台全部产品）：</div>';
+      for(const platform of selected){
+        const products=PLATFORM_PRODUCTS[platform]||[];
+        if(products.length<=1) continue;
+        html+=`<div style="margin-bottom:4px"><span style="font-weight:600;font-size:12px">${esc(platform)}：</span> `;
+        for(const product of products){
+          html+=`<label style="display:inline-flex;align-items:center;gap:4px;margin:2px 4px;font-size:12px;cursor:pointer"><input type="checkbox" class="product-choice" data-platform="${esc(platform)}" value="${esc(product)}" checked>${esc(product)}</label>`;
+        }
+        html+=`</div>`;
+      }
+      container.innerHTML=html;
+      container.style.display='block';
+    }
+    document.querySelectorAll('#platformChoices input').forEach(node=>node.addEventListener('change',renderProductSelector));
     function downloadPayload(){
       const platforms=[...document.querySelectorAll('#platformChoices input:checked')].map(node=>node.value);
-      return {start_date:$("startDate").value,end_date:$("endDate").value,download_drive:$("downloadDrive").value,platforms,inventory_workers:Number($("inventoryWorkers").value),download_workers:Number($("downloadWorkers").value),adaptive_download:$("adaptiveDownload").checked,refresh_inventory:$("refreshInventory").checked,continuous_upload:$("continuousUpload").checked};
+      const products=[...document.querySelectorAll('.product-choice:not(:checked)')].map(node=>({platform:node.dataset.platform,product:node.value}));
+      return {start_date:$("startDate").value,end_date:$("endDate").value,download_drive:$("downloadDrive").value,platforms,excluded_products:products,inventory_workers:Number($("inventoryWorkers").value),download_workers:Number($("downloadWorkers").value),adaptive_download:$("adaptiveDownload").checked,refresh_inventory:$("refreshInventory").checked,continuous_upload:$("continuousUpload").checked};
     }
     $("enqueueDownloadButton").addEventListener('click',async()=>{
       const payload=downloadPayload();

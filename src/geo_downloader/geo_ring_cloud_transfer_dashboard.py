@@ -2283,6 +2283,19 @@ class DashboardState:
                     stale_lock_recovery,
                 )
 
+            excluded_products_raw = request.get("excluded_products", [])
+            excluded_products = ""
+            if isinstance(excluded_products_raw, list) and excluded_products_raw:
+                pairs = []
+                for item in excluded_products_raw:
+                    if isinstance(item, dict):
+                        p = str(item.get("platform", "")).strip()
+                        prod = str(item.get("product", "")).strip()
+                        if p and prod:
+                            pairs.append("{}:{}".format(p, prod))
+                if pairs:
+                    excluded_products = ";".join(pairs)
+
             command = [
                 "powershell.exe",
                 "-NoProfile",
@@ -2311,6 +2324,8 @@ class DashboardState:
                 "-S3RangeMiB",
                 "4",
             ]
+            if excluded_products:
+                command.extend(["-ExcludedProducts", excluded_products])
             if adaptive_download:
                 command.extend(
                     [

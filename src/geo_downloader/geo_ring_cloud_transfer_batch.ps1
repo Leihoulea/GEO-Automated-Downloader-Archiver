@@ -21,7 +21,8 @@ param(
     [int]$S3RangeMiB = 4,
     [switch]$RefreshInventory,
     [switch]$SkipGoes,
-    [switch]$SkipMeteosat
+    [switch]$SkipMeteosat,
+    [string]$ExcludedProducts = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -288,6 +289,11 @@ $BatchLockStream.Flush()
 try {
     Write-BatchStatus -Phase "initialization" -Status "running"
     Clear-DownloadProxy
+    if ($ExcludedProducts) {
+        $env:GEO_RING_EXCLUDED_PRODUCTS = $ExcludedProducts
+    } else {
+        Remove-Item Env:\GEO_RING_EXCLUDED_PRODUCTS -ErrorAction SilentlyContinue
+    }
     if ($MeteosatPlatforms.Count -gt 0) {
         Read-EumetsatCredentials
     }
