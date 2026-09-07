@@ -226,13 +226,12 @@
         <label class="platform-choice"><input type="checkbox" value="Meteosat-0deg">Meteosat 0°</label>
         <label class="platform-choice"><input type="checkbox" value="Meteosat-IODC">Meteosat IODC</label>
         <label class="platform-choice" title="DSCOVR EPIC L2 Cloud（NASA ASDC）为独立参考数据集，需设置 EARTHDATA_PASSWORD 环境变量；建议单独批次，不与 GEO-ring 混批。"><input type="checkbox" value="DSCOVR-EPIC">DSCOVR EPIC L2 Cloud</label>
-      </div>
-      <div id="productSelector" style="margin:10px 0;display:none"></div>
         <span class="platform-choice" title="CM SAF 要求注册并登录后提交订单，不能与匿名对象存储使用同一种直下载流程。">
           <input type="checkbox" value="CLAAS3-0deg" disabled>CLAAS-3（CMA/CTX/CPP）· 需先下单
         </span>
         <a class="platform-choice" href="https://wui.cmsaf.eu/safira/action/viewDoiDetails?acronym=CLAAS_V003" target="_blank" rel="noopener">打开 CLAAS-3 官方订单页 ↗</a>
       </div>
+      <div id="productSelector" style="margin:10px 0;padding:8px 12px;border:1px solid var(--line);border-radius:10px;background:#faf9f4;display:none"></div>
       <div class="launch-actions">
         <div class="launch-note"><label><input id="refreshInventory" type="checkbox"> 强制刷新清单（通常不勾选，重复任务会复用缓存）</label><br><label><input id="adaptiveDownload" type="checkbox" checked> 下载自动调速：从 4 路开始，依据实际吞吐与错误率逐级升降（上限由上方选择）</label><br><label><input id="continuousUpload" type="checkbox" checked> 全自动流水线：下载时单路上传，下载结束后自动按 2→3→4 路提速，并执行服务器 SHA-256 全量复核</label><br>网络模式固定为 <b>direct_only</b>，任务不会自动删除本地文件。<span id="notificationStatus">邮件通知未配置</span>。CLAAS-3 是 CM SAF 订单型数据源，须先登录官方页面下单，不能在此处伪装成直接下载。</div>
         <div><button class="button" id="configureEmailButton" type="button">配置邮件</button> <button class="button" id="testEmailButton" type="button" disabled>发送测试邮件</button> <button class="button" id="enqueueDownloadButton" type="button">加入空间感知队列</button> <button class="button primary" id="startDownloadButton" type="button">立即创建并启动</button></div>
