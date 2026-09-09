@@ -53,6 +53,7 @@ DEFAULT_RAW_GIB_PER_PLATFORM_DAY = {
     "Meteosat-0deg": 0.08,  # expanded: CLM, CTH, CTTH, CT, OCA, CMIC, CLA
     "Meteosat-IODC": 0.08,
     "DSCOVR-EPIC": 0.42,
+    "DSCOVR-EPIC-AER": 0.42,
 }
 DEFAULT_PLATFORM_SAFETY_FACTOR = {
     "GOES-16": 1.30,

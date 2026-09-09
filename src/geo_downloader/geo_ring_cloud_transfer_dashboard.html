@@ -226,6 +226,7 @@
         <label class="platform-choice"><input type="checkbox" value="Meteosat-0deg">Meteosat 0°</label>
         <label class="platform-choice"><input type="checkbox" value="Meteosat-IODC">Meteosat IODC</label>
         <label class="platform-choice" title="DSCOVR EPIC L2 Cloud（NASA ASDC）为独立参考数据集，需设置 EARTHDATA_PASSWORD 环境变量；建议单独批次，不与 GEO-ring 混批。"><input type="checkbox" value="DSCOVR-EPIC">DSCOVR EPIC L2 Cloud</label>
+        <label class="platform-choice" title="DSCOVR EPIC L2 UV Aerosol（NASA ASDC），需 EARTHDATA 认证。"><input type="checkbox" value="DSCOVR-EPIC-AER">DSCOVR EPIC L2 AER</label>
         <span class="platform-choice" title="CM SAF 要求注册并登录后提交订单，不能与匿名对象存储使用同一种直下载流程。">
           <input type="checkbox" value="CLAAS3-0deg" disabled>CLAAS-3（CMA/CTX/CPP）· 需先下单
         </span>
@@ -687,6 +688,7 @@
       'Meteosat-0deg':['CLM','CTH','CTTH','CT','OCA','CMIC','CLA'],
       'Meteosat-IODC':['CLM','CTH','CTTH','CT','OCA','CMIC','CLA'],
       'DSCOVR-EPIC':['EPIC-L2-CLOUD'],
+      'DSCOVR-EPIC-AER':['EPIC-L2-AER'],
     };
     function renderProductSelector(){
       const selected=[...document.querySelectorAll('#platformChoices input:checked')].map(n=>n.value);

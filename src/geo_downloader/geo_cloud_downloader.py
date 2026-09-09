@@ -127,21 +127,37 @@ METEOSAT_CONFIG = {
 # kept in a separate batch and never mixed with the GEO-ring baseline.  The
 # inventory is driven by the CMR granule search API rather than a fixed URL
 # list, so any date range can be discovered automatically.
-EPIC_CONFIG = {
-    "platform": "DSCOVR-EPIC",
-    "service": "DSCOVR-EPIC",
-    "short_name": "DSCOVR_EPIC_L2_CLOUD",
-    "version": "03",
-    "collection_concept_id": "C2722461573-LARC_CLOUD",
-    "product": "EPIC-L2-CLOUD",
-    "bucket": "asdc-prod-protected",
-}
+EPIC_CONFIGS = [
+    {
+        "platform": "DSCOVR-EPIC",
+        "service": "DSCOVR-EPIC",
+        "short_name": "DSCOVR_EPIC_L2_CLOUD",
+        "version": "03",
+        "collection_concept_id": "C2722461573-LARC_CLOUD",
+        "product": "EPIC-L2-CLOUD",
+        "bucket": "asdc-prod-protected",
+        "file_ext": ".nc4",
+    },
+    {
+        "platform": "DSCOVR-EPIC-AER",
+        "service": "DSCOVR-EPIC-AER",
+        "short_name": "DSCOVR_EPIC_L2_AER",
+        "version": "03",
+        "collection_concept_id": "C2722461720-LARC_CLOUD",
+        "product": "EPIC-L2-AER",
+        "bucket": "asdc-prod-protected",
+        "file_ext": ".he5",
+    },
+]
+
+# Backward compatibility: EPIC_CONFIG points to the first (cloud) config
+EPIC_CONFIG = EPIC_CONFIGS[0]
 
 PLATFORM_CHOICES = tuple(
     list(GOES_CONFIG)
     + [HIMAWARI_CONFIG["platform"]]
     + list(METEOSAT_CONFIG)
-    + [EPIC_CONFIG["platform"]]
+    + [cfg["platform"] for cfg in EPIC_CONFIGS]
 )
 
 MANIFEST_FIELDS = [
@@ -1268,6 +1284,7 @@ def write_meteosat_inventory_summary(root: Path, rows: list[dict]) -> None:
 def epic_cmr_search_granules(
     start: datetime,
     end: datetime,
+    concept_id: str,
     page_size: int = EPIC_CMR_PAGE_SIZE,
 ) -> list[dict]:
     """Page through NASA CMR granule entries for the EPIC L2 Cloud collection.
@@ -1285,7 +1302,7 @@ def epic_cmr_search_granules(
     last_error: Optional[str] = None
     while True:
         params = {
-            "concept_id": EPIC_CONFIG["collection_concept_id"],
+            "concept_id": concept_id,
             "temporal": temporal,
             "page_size": page_size,
             "page_num": page_num,
@@ -1341,24 +1358,23 @@ def inventory_epic_range(
     root: Path,
     start_date: str,
     end_date: str,
+    epic_config: Optional[dict] = None,
 ) -> list[dict]:
-    """Inventory DSCOVR EPIC L2 Cloud granules for a date range via CMR.
+    """Inventory DSCOVR EPIC L2 granules for a date range via CMR.
 
-    Unlike the GEO platforms, EPIC has no fixed hourly cadence (the L1
-    imager acquires roughly every 108 minutes), so the manifest lists every
-    granule CMR reports in the range rather than targeting synthetic hourly
-    slots.  ``target_time_utc`` is the granule ``time_start``.
+    If epic_config is None, uses the default EPIC_CONFIG (L2 Cloud).
     """
+    cfg = epic_config or EPIC_CONFIG
     start = datetime.fromisoformat(start_date).replace(tzinfo=timezone.utc)
     end_day = datetime.fromisoformat(end_date).replace(tzinfo=timezone.utc) + timedelta(days=1)
-    platform = EPIC_CONFIG["platform"]
-    service = EPIC_CONFIG["service"]
-    product = EPIC_CONFIG["product"]
-    collection_id = EPIC_CONFIG["collection_concept_id"]
-    bucket = EPIC_CONFIG["bucket"]
+    platform = cfg["platform"]
+    service = cfg["service"]
+    product = cfg["product"]
+    collection_id = cfg["collection_concept_id"]
+    bucket = cfg["bucket"]
     rows: list[dict] = []
     try:
-        entries = epic_cmr_search_granules(start, end_day)
+        entries = epic_cmr_search_granules(start, end_day, collection_id)
         listing_error = ""
     except Exception as exc:
         entries = []
@@ -1592,6 +1608,7 @@ def run_download_epic_range(
     adaptive_workers: bool = False,
     min_workers: int = DEFAULT_ADAPTIVE_MIN_WORKERS,
     initial_workers: int = DEFAULT_ADAPTIVE_INITIAL_WORKERS,
+    platform: Optional[str] = None,
 ) -> Path:
     disable_proxy_environment()
     max_workers = validate_worker_count(max_workers, MAX_EPIC_WORKERS, "max_workers")
@@ -1599,13 +1616,22 @@ def run_download_epic_range(
     if not inventory.exists():
         raise FileNotFoundError(f"Inventory not found: {inventory}")
 
+    # Determine which EPIC configs to use
+    if platform:
+        epic_cfgs = [c for c in EPIC_CONFIGS if c["platform"] == platform]
+        if not epic_cfgs:
+            raise ValueError(f"Unknown EPIC platform: {platform}")
+    else:
+        epic_cfgs = EPIC_CONFIGS
+    epic_platforms = {c["platform"] for c in epic_cfgs}
+
     start_prefix = f"{start_date}T"
     end_dt = datetime.fromisoformat(end_date).replace(tzinfo=timezone.utc) + timedelta(days=1)
     rows = []
     for row in read_manifest(inventory):
         if row["status"] != "found" or row["remote_type"] != "earthdata":
             continue
-        if row.get("platform") != EPIC_CONFIG["platform"]:
+        if row.get("platform") not in epic_platforms:
             continue
         target_dt = parse_iso_utc(row["target_time_utc"])
         if row["target_time_utc"] >= start_prefix and target_dt < end_dt:
@@ -1880,7 +1906,7 @@ def run_inventory(
     include_goes = bool(selected.intersection(GOES_CONFIG))
     include_himawari = HIMAWARI_CONFIG["platform"] in selected
     include_selected_meteosat = include_meteosat and bool(selected.intersection(METEOSAT_CONFIG))
-    include_epic = EPIC_CONFIG["platform"] in selected
+    include_epic = bool(selected.intersection({c["platform"] for c in EPIC_CONFIGS}))
     if bool(start_date) != bool(end_date):
         raise ValueError("start_date and end_date must be supplied together")
     if start_date and end_date:
@@ -1948,12 +1974,15 @@ def run_inventory(
     if include_epic:
         epic_start = days[0].strftime("%Y-%m-%d")
         epic_end = days[-1].strftime("%Y-%m-%d")
-        jobs.append(
-            (
-                f"EPIC L2 Cloud {epic_start}..{epic_end}",
-                lambda s=epic_start, e=epic_end: inventory_epic_range(root, s, e),
+        for cfg in EPIC_CONFIGS:
+            if cfg["platform"] not in selected:
+                continue
+            jobs.append(
+                (
+                    f"EPIC {cfg['product']} {epic_start}..{epic_end}",
+                    lambda s=epic_start, e=epic_end, c=cfg: inventory_epic_range(root, s, e, c),
+                )
             )
-        )
 
     rows: list[dict] = []
     log_path = root / "logs" / "inventory.log"
@@ -2085,9 +2114,26 @@ def validate_file(path: Path, row: Optional[dict] = None) -> tuple[bool, str]:
                 combined = lowered + " " + " ".join(name.lower() for name in group_names)
                 if not any(token in combined for token in ["cloud", "height", "geophysical", "geolocation"]):
                     return False, "epic_expected_cloud_variables_not_detected"
+            if product == "EPIC-L2-AER":
+                if not any(token in lowered for token in ["aerosol", "aer", "uv", "reflectance"]):
+                    if not group_names or not any(token in " ".join(g.lower() for g in group_names) for token in ["aerosol", "aer", "uv"]):
+                        return False, "epic_aer_expected_aerosol_variables_not_detected"
         return True, "netcdf_ok"
     except Exception as exc:
         return False, f"netcdf_error={type(exc).__name__}: {exc}"
+
+    # HDF5 files (.he5) - used by EPIC L2 AER
+    if ".he5" in suffixes:
+        try:
+            import h5py
+
+            with h5py.File(path, "r") as f:
+                keys = list(f.keys())
+                if not keys:
+                    return False, "no_hdf5_groups"
+            return True, "hdf5_ok"
+        except Exception as exc:
+            return False, f"hdf5_error={type(exc).__name__}: {exc}"
 
 
 def log_variable_table(path: Path, names: list[str]) -> None:
@@ -2616,6 +2662,11 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     )
     epic_download.add_argument("--min-workers", type=int, default=DEFAULT_ADAPTIVE_MIN_WORKERS)
     epic_download.add_argument("--initial-workers", type=int, default=DEFAULT_ADAPTIVE_INITIAL_WORKERS)
+    epic_download.add_argument(
+        "--platform",
+        choices=tuple(c["platform"] for c in EPIC_CONFIGS),
+        help="Limit to one EPIC product platform.",
+    )
 
     first = sub.add_parser("first-round", help="Run inventory then test-day download.")
     first.add_argument("--date", default=TEST_DAY, help="UTC test day, YYYY-MM-DD.")
@@ -2728,6 +2779,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 args.adaptive_workers,
                 args.min_workers,
                 args.initial_workers,
+                getattr(args, 'platform', None),
             )
             print(out)
         elif args.command == "first-round":

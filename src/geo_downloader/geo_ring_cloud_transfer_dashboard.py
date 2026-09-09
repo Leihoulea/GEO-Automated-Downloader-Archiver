@@ -92,6 +92,7 @@ DOWNLOAD_PLATFORM_NAMES = (
     "Meteosat-0deg",
     "Meteosat-IODC",
     "DSCOVR-EPIC",
+    "DSCOVR-EPIC-AER",
 )
 FY4B_EXTERNAL_SOURCE = "FY4B 官方应用本地导入"
 FY4B_OFFICIAL_MAPPING_PROFILE = "fy4b_agri_l2_product_day_hour_v1"
@@ -2225,6 +2226,7 @@ class DashboardState:
                 "Meteosat-0deg": "m0",
                 "Meteosat-IODC": "miodc",
                 "DSCOVR-EPIC": "epic",
+                "DSCOVR-EPIC-AER": "aer",
             }
             batch_name = "{}_{}_{}".format(
                 start_date.strftime("%Y%m%d"),

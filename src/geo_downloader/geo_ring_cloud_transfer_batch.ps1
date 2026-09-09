@@ -46,7 +46,7 @@ if (-not [string]::IsNullOrWhiteSpace($PythonExe)) {
         throw "Python executable does not exist: $ResolvedPythonExe"
     }
 }
-$AllowedPlatforms = @("GOES-16", "GOES-18", "Himawari-9", "Meteosat-0deg", "Meteosat-IODC", "DSCOVR-EPIC")
+$AllowedPlatforms = @("GOES-16", "GOES-18", "Himawari-9", "Meteosat-0deg", "Meteosat-IODC", "DSCOVR-EPIC", "DSCOVR-EPIC-AER")
 $SelectedPlatforms = @(
     $Platforms.Split(",") |
         ForEach-Object { $_.Trim() } |
@@ -69,7 +69,7 @@ if ($SelectedPlatforms.Count -eq 0) {
 }
 $S3Platforms = @($SelectedPlatforms | Where-Object { $_.StartsWith("GOES-") -or $_ -eq "Himawari-9" })
 $MeteosatPlatforms = @($SelectedPlatforms | Where-Object { $_.StartsWith("Meteosat-") })
-$EpicPlatforms = @($SelectedPlatforms | Where-Object { $_ -eq "DSCOVR-EPIC" })
+$EpicPlatforms = @($SelectedPlatforms | Where-Object { $_ -eq "DSCOVR-EPIC" -or $_ -eq "DSCOVR-EPIC-AER" })
 
 $ScriptSha256 = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash.ToLowerInvariant()
 $ProjectPrefix = $GeoRingProjectRoot.TrimEnd("\") + "\"
@@ -363,19 +363,22 @@ try {
     if ($EpicPlatforms.Count -gt 0) {
         Write-BatchStatus -Phase "epic_download" -Status "running"
         $EpicWorkers = [Math]::Min($DownloadWorkers, 8)
-        $EpicArguments = @(
-            $Downloader, "--root", $BatchRoot, "download-epic-range",
-            "--start-date", $StartDate, "--end-date", $EndDate,
-            "--max-workers", $EpicWorkers.ToString()
-        )
-        if ($AdaptiveDownload) {
-            $EpicArguments += @(
-                "--adaptive-workers",
-                "--min-workers", ([Math]::Min($DownloadMinWorkers, $EpicWorkers)).ToString(),
-                "--initial-workers", ([Math]::Min($DownloadInitialWorkers, $EpicWorkers)).ToString()
+        foreach ($EpicPlatform in $EpicPlatforms) {
+            $EpicArguments = @(
+                $Downloader, "--root", $BatchRoot, "download-epic-range",
+                "--start-date", $StartDate, "--end-date", $EndDate,
+                "--max-workers", $EpicWorkers.ToString(),
+                "--platform", $EpicPlatform
             )
+            if ($AdaptiveDownload) {
+                $EpicArguments += @(
+                    "--adaptive-workers",
+                    "--min-workers", ([Math]::Min($DownloadMinWorkers, $EpicWorkers)).ToString(),
+                    "--initial-workers", ([Math]::Min($DownloadInitialWorkers, $EpicWorkers)).ToString()
+                )
+            }
+            Invoke-DownloadPython -Arguments $EpicArguments
         }
-        Invoke-DownloadPython -Arguments $EpicArguments
     }
 
     Clear-DownloadProxy

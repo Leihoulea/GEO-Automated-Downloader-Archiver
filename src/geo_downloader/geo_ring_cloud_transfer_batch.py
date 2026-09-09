@@ -43,6 +43,7 @@ PLATFORM_REMOTE_RELATIVE = {
     "FY4B": PurePosixPath("FY4B"),
     "CMSAF": PurePosixPath("CM SAF"),
     "DSCOVR-EPIC": PurePosixPath("DSCOVR-EPIC"),
+    "DSCOVR-EPIC-AER": PurePosixPath("DSCOVR-EPIC-AER"),
 }
 
 
