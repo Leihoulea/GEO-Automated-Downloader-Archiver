@@ -35,6 +35,13 @@ from geo_ring_cloud.notifications import (  # noqa: E402
     PersistentEmailNotifier,
     save_secure_email_config,
 )
+from geo_ring_cloud.settings_store import (  # noqa: E402
+    apply_to_environment,
+    load_settings,
+    public_settings,
+    save_settings,
+    settings_path,
+)
 from geo_ring_cloud.batch_queue import (  # noqa: E402
     ACTIVE_QUEUE_STATUSES,
     CANCELLABLE_QUEUE_STATUSES,
@@ -822,17 +829,22 @@ def download_launcher_status(
         "EXITED",
         "CANCELLED",
         "CANCELED",
+        "STOPPED",
     }
     has_terminal_record = (
         str(payload.get("status", "")).upper() in terminal_statuses
         or bool(payload.get("finished_at"))
         or payload.get("exit_code") is not None
     )
+    # STOPPED is an authoritative user-initiated terminal state: never let a
+    # stale heartbeat resurrect a batch that the user explicitly stopped.
+    heartbeat = read_heartbeat(transfer_dir / DOWNLOAD_HEARTBEAT_NAME)
+    if str(payload.get("status", "")).upper() == "STOPPED":
+        payload["process_alive"] = False
     # Use heartbeat for liveness detection instead of PID probing.
     # The heartbeat is written by the download process every 10 seconds;
     # a fresh heartbeat means the process is alive regardless of PID.
-    heartbeat = read_heartbeat(transfer_dir / DOWNLOAD_HEARTBEAT_NAME)
-    if heartbeat["alive"]:
+    elif heartbeat["alive"]:
         payload["process_alive"] = True
     elif has_terminal_record:
         payload["process_alive"] = False
@@ -858,7 +870,7 @@ def download_launcher_status(
         and corrupt_rows == 0
         and (inventory_rows == 0 or downloaded_rows + missing_rows >= inventory_rows)
     )
-    if locally_complete and not has_recent_download_part(transfer_dir):
+    if locally_complete and not has_recent_download_part(transfer_dir) and str(payload.get("status", "")).upper() != "STOPPED":
         changed = str(payload.get("status", "")).upper() != "COMPLETE"
         payload.update(
             {
@@ -940,7 +952,9 @@ def build_pipeline_stages(
     inventory_state = "pass" if inventory_rows else "running"
     download_total = int(download.get("total", 0))
     download_done = int(download.get("overall_completed", 0))
-    if download_total and download_done >= download_total and not parts.get("count"):
+    if download.get("completion_state") == "stopped":
+        download_state = "warning"
+    elif download_total and download_done >= download_total and not parts.get("count"):
         download_state = "pass" if not download.get("failed") else "warning"
     elif download_total:
         download_state = "running"
@@ -1052,11 +1066,16 @@ class DashboardState:
         self.manifest_dir = self.batch_root / "manifests"
         self.log_dir = self.batch_root / "logs"
         self.transfer_dir = self.batch_root / "transfer"
-        self.ssh_target = ssh_target
-        self.identity_file = identity_file.resolve() if identity_file else None
-        self.auto_upload_root = auto_upload_root
-        self.allowed_server_parent = allowed_server_parent
-        self.conda_environment = conda_environment
+        persisted = load_settings()
+        self.ssh_target = ssh_target or str(persisted.get("ssh_target", ""))
+        id_file_str = str(persisted.get("identity_file", "") or "")
+        if identity_file:
+            id_file_str = str(identity_file)
+        self.identity_file = Path(id_file_str).resolve() if id_file_str else None
+        self.auto_upload_root = auto_upload_root or str(persisted.get("server_root", ""))
+        self.allowed_server_parent = allowed_server_parent or str(persisted.get("allowed_server_parent", ""))
+        self.conda_environment = conda_environment or str(persisted.get("conda_environment", "pytorch"))
+        self._settings_lock = threading.Lock()
         self._upload_lock = threading.Lock()
         self._download_lock = threading.Lock()
         self._queue_lock = threading.RLock()
@@ -1073,10 +1092,88 @@ class DashboardState:
         self.email_notifier = PersistentEmailNotifier(self.notification_state_path)
         self.notification_setup_token = secrets.token_urlsafe(32)
         self.notification_setup_defaults = {
-            "sender": str(notification_setup_sender or os.environ.get("GEO_RING_NOTIFY_SETUP_SENDER", "")).strip(),
-            "recipient": str(notification_setup_recipient or os.environ.get("GEO_RING_NOTIFY_SETUP_RECIPIENT", "")).strip(),
+            "sender": str(notification_setup_sender or persisted.get("smtp_sender", "") or os.environ.get("GEO_RING_NOTIFY_SETUP_SENDER", "")).strip(),
+            "recipient": str(notification_setup_recipient or persisted.get("smtp_recipient", "") or os.environ.get("GEO_RING_NOTIFY_SETUP_RECIPIENT", "")).strip(),
         }
         self._notification_process: Optional[subprocess.Popen] = None
+        self._download_process: Optional[subprocess.Popen] = None
+        self._download_process_lock = threading.Lock()
+
+    def update_settings(self, request: Dict[str, object]) -> Dict[str, object]:
+        """Persist dashboard settings from a web form, then apply to runtime."""
+        current = load_settings()
+        updated = dict(current)
+        non_secret_keys = [
+            "ssh_target", "identity_file", "server_root",
+            "allowed_server_parent", "download_root", "conda_environment",
+            "earthdata_username", "smtp_host", "smtp_port",
+            "smtp_user", "smtp_sender", "smtp_recipient",
+            "smtp_ssl", "smtp_starttls",
+        ]
+        secret_keys = [
+            "eumetsat_consumer_key", "eumetsat_consumer_secret",
+            "earthdata_password", "smtp_password",
+        ]
+        for key in non_secret_keys:
+            if key in request:
+                val = request[key]
+                if key in ("smtp_port",):
+                    try:
+                        updated[key] = int(val)
+                    except (TypeError, ValueError):
+                        pass
+                elif key in ("smtp_ssl", "smtp_starttls"):
+                    updated[key] = bool(val)
+                else:
+                    updated[key] = str(val or "").strip()
+        for key in secret_keys:
+            val = str(request.get(key, "") or "")
+            if val and not val.startswith("*"):
+                updated[key] = val
+        save_settings(updated)
+        with self._settings_lock:
+            self.ssh_target = str(updated.get("ssh_target", ""))
+            id_str = str(updated.get("identity_file", "") or "")
+            self.identity_file = Path(id_str).resolve() if id_str else None
+            self.auto_upload_root = str(updated.get("server_root", ""))
+            self.allowed_server_parent = str(updated.get("allowed_server_parent", ""))
+            self.conda_environment = str(updated.get("conda_environment", "pytorch"))
+            self.notification_setup_defaults = {
+                "sender": str(updated.get("smtp_sender", "")),
+                "recipient": str(updated.get("smtp_recipient", "")),
+            }
+        apply_to_environment()
+        self.email_notifier.reload_settings()
+        return public_settings()
+
+    def get_settings(self) -> Dict[str, object]:
+        """Return masked settings safe to display in the browser."""
+        return public_settings()
+
+    def test_ssh_connection(self) -> Dict[str, object]:
+        """Quick connectivity check: can we reach the SSH target?"""
+        if not self.ssh_target:
+            raise RuntimeError("SSH 目标未配置。")
+        if not self.identity_file or not self.identity_file.is_file():
+            raise RuntimeError("SSH 私钥文件不存在：{}".format(self.identity_file or "(未配置)"))
+        try:
+            result = subprocess.run(
+                [
+                    "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                    "-i", str(self.identity_file),
+                    self.ssh_target, "echo", "ok",
+                ],
+                capture_output=True, text=True, timeout=15,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if result.returncode == 0 and "ok" in result.stdout:
+                return {"status": "PASS", "target": self.ssh_target}
+            stderr = (result.stderr or "").strip()
+            return {"status": "FAIL", "target": self.ssh_target, "error": stderr or "exit code {}".format(result.returncode)}
+        except FileNotFoundError:
+            return {"status": "FAIL", "target": self.ssh_target, "error": "系统未安装 ssh 命令"}
+        except Exception as exc:
+            return {"status": "FAIL", "target": self.ssh_target, "error": "{}: {}".format(type(exc).__name__, exc)}
 
     def _known_batch_parents(self) -> List[Path]:
         parents = {self.batch_parent.resolve()}
@@ -1651,6 +1748,12 @@ class DashboardState:
                     status_message="下载批次正在运行。",
                     updated_at=utc_now_text(),
                 )
+            elif download_status == "STOPPED":
+                item.update(
+                    status="STOPPED",
+                    status_message="用户手动停止下载批次；可恢复继续。",
+                    updated_at=utc_now_text(),
+                )
 
     def process_batch_queue_once(self) -> Dict[str, object]:
         with self._queue_dispatch_lock:
@@ -1997,6 +2100,9 @@ class DashboardState:
                 or raw_batch_status.get("message")
                 or "下载批次失败。"
             )
+        elif launcher.get("status") == "STOPPED":
+            combined_download["completion_state"] = "stopped"
+            combined_download["completion_message"] = "下载已停止。已下载的文件保留，可点恢复下载继续。"
         elif files_complete:
             combined_download["completion_state"] = "files_complete"
             combined_download["completion_message"] = "目标文件已经齐全。"
@@ -2048,6 +2154,8 @@ class DashboardState:
         overall_state = "running"
         if run_failed:
             overall_state = "launch_failed"
+        elif launcher.get("status") == "STOPPED":
+            overall_state = "stopped"
         elif server.get("status") == "FAIL":
             overall_state = "blocked"
         elif auto_upload.get("status") in {"FAIL", "STOPPED", "STALLED"}:
@@ -2175,6 +2283,7 @@ class DashboardState:
                 "automatic_delete": False,
                 "cleanup_button_deletes_data": False,
             },
+            "settings": self.get_settings(),
         }
 
     def start_download(self, request: Dict[str, object]) -> Dict[str, object]:
@@ -2228,10 +2337,42 @@ class DashboardState:
                 "DSCOVR-EPIC": "epic",
                 "DSCOVR-EPIC-AER": "aer",
             }
-            batch_name = "{}_{}_{}".format(
+            # Include excluded products in batch name so different product
+            # selections produce distinct batch names.
+            excluded_products_raw = request.get("excluded_products", [])
+            product_suffix = ""
+            if isinstance(excluded_products_raw, list) and excluded_products_raw:
+                # If some products are excluded, list what's included
+                all_products = {
+                    "GOES-16": {"ACMF", "ACHAF", "ACTPF", "CTPF", "ACHTF", "CODF", "CPSF"},
+                    "GOES-18": {"ACMF", "ACHAF", "ACTPF", "CTPF", "ACHTF", "CODF", "CPSF"},
+                    "Himawari-9": {"CMSK", "CHGT"},
+                    "Meteosat-0deg": {"CLM", "CTH", "CTTH", "CT", "OCA", "CMIC", "CLA"},
+                    "Meteosat-IODC": {"CLM", "CTH", "CTTH", "CT", "OCA", "CMIC", "CLA"},
+                    "DSCOVR-EPIC": {"EPIC-L2-CLOUD"},
+                    "DSCOVR-EPIC-AER": {"EPIC-L2-AER"},
+                }
+                excluded_set = set()
+                for item in excluded_products_raw:
+                    if isinstance(item, dict):
+                        p = str(item.get("platform", "")).strip()
+                        prod = str(item.get("product", "")).strip()
+                        if p and prod:
+                            excluded_set.add((p, prod))
+                included_parts = []
+                for plat in platforms:
+                    plat_all = all_products.get(plat, set())
+                    plat_excluded = {prod for p, prod in excluded_set if p == plat}
+                    plat_included = sorted(plat_all - plat_excluded)
+                    if len(plat_included) < len(plat_all) and plat_included:
+                        included_parts.append(short_names.get(plat, plat) + "_" + "-".join(plat_included))
+                if included_parts:
+                    product_suffix = "_" + "-".join(included_parts)
+            batch_name = "{}_{}_{}{}".format(
                 start_date.strftime("%Y%m%d"),
                 end_date.strftime("%Y%m%d"),
                 "-".join(short_names[name] for name in platforms),
+                product_suffix,
             )
             active_task = self._active_download_task()
             if active_task:
@@ -2349,6 +2490,14 @@ class DashboardState:
                 environment.pop(name, None)
             environment["NO_PROXY"] = "*"
             environment["no_proxy"] = "*"
+            _persisted = load_settings()
+            if _persisted.get("eumetsat_consumer_key") and not environment.get("EUMETSAT_CONSUMER_KEY"):
+                environment["EUMETSAT_CONSUMER_KEY"] = str(_persisted["eumetsat_consumer_key"])
+            if _persisted.get("eumetsat_consumer_secret") and not environment.get("EUMETSAT_CONSUMER_SECRET"):
+                environment["EUMETSAT_CONSUMER_SECRET"] = str(_persisted["eumetsat_consumer_secret"])
+            if _persisted.get("earthdata_password") and not environment.get("EARTHDATA_PASSWORD"):
+                environment["EARTHDATA_PASSWORD"] = str(_persisted["earthdata_password"])
+                environment["EARTHDATA_USERNAME"] = str(_persisted.get("earthdata_username") or "kingofkunlun")
             stdout_path = batch_root / "transfer" / "launcher.stdout.log"
             stderr_path = batch_root / "transfer" / "launcher.stderr.log"
             creationflags = 0
@@ -2416,6 +2565,8 @@ class DashboardState:
                 }
             )
             write_json_atomic(launcher_status_path, launcher_payload)
+            with self._download_process_lock:
+                self._download_process = process
             if process.poll() is None:
                 threading.Thread(
                     target=self._watch_download_process,
@@ -2451,6 +2602,203 @@ class DashboardState:
                         type(exc).__name__, exc
                     )
             return result
+
+    def stop_download(self, batch_name: str = "") -> Dict[str, object]:
+        """Terminate the active download batch process tree.
+
+        Kills the PowerShell orchestrator and all its child Python processes
+        (inventory, download workers, etc.) via psutil.  Already-downloaded
+        files are preserved; only the running processes are stopped.
+        """
+        import psutil
+
+        killed_pids: List[int] = []
+        # 1. Try the stored Popen handle from the current dashboard session.
+        with self._download_process_lock:
+            process = self._download_process
+        if process and process.poll() is None:
+            try:
+                parent_proc = psutil.Process(process.pid)
+                children = parent_proc.children(recursive=True)
+                for child in children:
+                    try:
+                        child.terminate()
+                        killed_pids.append(child.pid)
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass
+                parent_proc.terminate()
+                killed_pids.append(process.pid)
+                try:
+                    parent_proc.wait(timeout=10)
+                except psutil.TimeoutExpired:
+                    parent_proc.kill()
+                    for child in children:
+                        try:
+                            child.kill()
+                        except (psutil.NoSuchProcess, psutil.AccessDenied):
+                            pass
+            except psutil.NoSuchProcess:
+                pass
+            with self._download_process_lock:
+                self._download_process = None
+
+        # 2. Also check the launcher_status.json for the PID (covers the case
+        #    where the dashboard was restarted but the batch is still running).
+        batch_root = self._resolve_existing_batch(batch_name)
+        launcher_status_path = batch_root / "transfer" / "download_launcher_status.json"
+        if launcher_status_path.is_file():
+            status = read_json(launcher_status_path)
+            pid = int(status.get("pid", 0) or 0)
+            if pid and pid not in killed_pids and process_is_running(pid):
+                try:
+                    parent_proc = psutil.Process(pid)
+                    children = parent_proc.children(recursive=True)
+                    for child in children:
+                        try:
+                            child.terminate()
+                            killed_pids.append(child.pid)
+                        except (psutil.NoSuchProcess, psutil.AccessDenied):
+                            pass
+                    parent_proc.terminate()
+                    killed_pids.append(pid)
+                    try:
+                        parent_proc.wait(timeout=10)
+                    except psutil.TimeoutExpired:
+                        parent_proc.kill()
+                        for child in children:
+                            try:
+                                child.kill()
+                            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                                pass
+                except psutil.NoSuchProcess:
+                    pass
+
+        # 3. Update download status files to reflect the stop.
+        stopped_at = utc_now_text()
+        if launcher_status_path.is_file():
+            launcher_payload = read_json(launcher_status_path)
+            launcher_payload.update(
+                {
+                    "status": "STOPPED",
+                    "process_alive": False,
+                    "stopped_at": stopped_at,
+                    "finished_at": stopped_at,
+                    "exit_code": -1,
+                    "updated_at": stopped_at,
+                    "message": "用户手动停止下载批次。已下载的文件保留，未删除任何数据。",
+                    "killed_pids": killed_pids,
+                }
+            )
+            write_json_atomic(launcher_status_path, launcher_payload)
+
+        # 3b. Clear heartbeats so a stale heartbeat doesn't block restart.
+        transfer_dir = batch_root / "transfer"
+        for hb_name in (DOWNLOAD_HEARTBEAT_NAME, UPLOAD_HEARTBEAT_NAME):
+            hb_path = transfer_dir / hb_name
+            if hb_path.exists():
+                for _attempt in range(8):
+                    try:
+                        hb_path.unlink()
+                        break
+                    except PermissionError:
+                        time.sleep(0.25)
+                    except OSError:
+                        break
+
+        # 3c. Remove the batch_run.lock file (PS1 finally block didn't run under TerminateProcess).
+        lock_path = transfer_dir / "batch_run.lock"
+        if lock_path.exists():
+            for _attempt in range(12):
+                try:
+                    lock_path.unlink()
+                    break
+                except PermissionError:
+                    time.sleep(0.25)
+                except OSError:
+                    break
+
+        # 4. Also stop the upload process if one is running for this batch.
+        upload_status_path = batch_root / "transfer" / "auto_upload_status.json"
+        if upload_status_path.is_file():
+            upload_status = read_json(upload_status_path)
+            upload_pid = int(upload_status.get("pid", 0) or 0)
+            if upload_pid and process_is_running(upload_pid):
+                try:
+                    upload_proc = psutil.Process(upload_pid)
+                    upload_children = upload_proc.children(recursive=True)
+                    for child in upload_children:
+                        try:
+                            child.terminate()
+                            killed_pids.append(child.pid)
+                        except (psutil.NoSuchProcess, psutil.AccessDenied):
+                            pass
+                    upload_proc.terminate()
+                    killed_pids.append(upload_pid)
+                    try:
+                        upload_proc.wait(timeout=10)
+                    except psutil.TimeoutExpired:
+                        upload_proc.kill()
+                        for child in upload_children:
+                            try:
+                                child.kill()
+                            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                                pass
+                except psutil.NoSuchProcess:
+                    pass
+            upload_payload = read_json(upload_status_path)
+            upload_payload.update(
+                {
+                    "status": "STOPPED",
+                    "phase": "stopped_by_user",
+                    "updated_at": utc_now_text(),
+                    "message": "用户手动停止，上传进程已终止。已上传的文件保留，未删除任何数据。",
+                }
+            )
+            write_json_atomic(upload_status_path, upload_payload)
+
+        return {
+            "status": "STOPPED",
+            "killed_pids": killed_pids,
+            "batch_name": batch_name or "",
+            "message": "下载和上传批次已停止。已下载/上传的文件保留，未删除任何数据。可点恢复下载继续。",
+        }
+
+    def resume_download(self, batch_name: str = "", overrides: Optional[Dict[str, object]] = None) -> Dict[str, object]:
+        """Resume a stopped batch, optionally overriding parameters like download_workers.
+
+        Reads start_date/end_date/platforms from batch_status.json so the user
+        doesn't need to re-enter them.  Already-downloaded files are skipped;
+        .part files are resumed.  The caller may pass overrides (e.g. higher
+        download_workers) to adjust settings for the resumed run.
+        """
+        batch_root = self._resolve_existing_batch(batch_name)
+        transfer_dir = batch_root / "transfer"
+        raw = read_json(transfer_dir / "batch_status.json")
+        launcher = read_json(transfer_dir / "download_launcher_status.json")
+        # Guard: only resume a stopped/failed batch, not a running one.
+        current_status = str(launcher.get("status", "")).upper()
+        if current_status in {"STARTING", "RUNNING"} and launcher.get("process_alive"):
+            raise RuntimeError("该批次仍在运行中，不能恢复。")
+        # Recover original parameters.
+        start_date = str(raw.get("start_date") or launcher.get("start_date") or "")
+        end_date = str(raw.get("end_date") or launcher.get("end_date") or "")
+        platforms = list(raw.get("platforms") or launcher.get("platforms") or [])
+        if not start_date or not end_date or not platforms:
+            raise RuntimeError("批次缺少日期或平台信息，无法恢复。请用立即创建并启动重新开始。")
+        # Build a restart request: original params as defaults, overrides on top.
+        ov = overrides or {}
+        request: Dict[str, object] = {
+            "start_date": start_date,
+            "end_date": end_date,
+            "platforms": platforms,
+            "inventory_workers": int(ov.get("inventory_workers") or raw.get("inventory_workers", 8) or 8),
+            "download_workers": int(ov.get("download_workers") or raw.get("download_workers", 12) or 12),
+            "adaptive_download": bool(ov.get("adaptive_download", True)),
+            "refresh_inventory": False,
+            "continuous_upload": bool(ov.get("continuous_upload", raw.get("continuous_upload", False))),
+            "download_drive": batch_root.drive or "",
+        }
+        return self.start_download(request)
 
     def _require_upload_configuration(self) -> None:
         if not self.ssh_target or self.identity_file is None:
@@ -2851,6 +3199,29 @@ def make_handler(state: DashboardState):
                         }
                     )
                     return
+                if path == "/api/actions/stop-download":
+                    payload = self.read_json_body()
+                    self.send_json(
+                        {
+                            "ok": True,
+                            "stop": state.stop_download(
+                                str(payload.get("batch_name", ""))
+                            ),
+                        }
+                    )
+                    return
+                if path == "/api/actions/resume-download":
+                    payload = self.read_json_body()
+                    self.send_json(
+                        {
+                            "ok": True,
+                            "download": state.resume_download(
+                                str(payload.get("batch_name", "")),
+                                overrides=payload,
+                            ),
+                        }
+                    )
+                    return
                 if path == "/api/actions/start-auto-upload":
                     payload = self.read_json_body()
                     self.send_json(
@@ -2906,6 +3277,33 @@ def make_handler(state: DashboardState):
                         {
                             "ok": True,
                             "email": state.configure_email(payload),
+                        }
+                    )
+                    return
+                if path == "/api/actions/get-settings":
+                    self.read_json_body()
+                    self.send_json(
+                        {
+                            "ok": True,
+                            "settings": state.get_settings(),
+                        }
+                    )
+                    return
+                if path == "/api/actions/save-settings":
+                    payload = self.read_json_body(required=True)
+                    self.send_json(
+                        {
+                            "ok": True,
+                            "settings": state.update_settings(payload),
+                        }
+                    )
+                    return
+                if path == "/api/actions/test-ssh":
+                    self.read_json_body()
+                    self.send_json(
+                        {
+                            "ok": True,
+                            "ssh": state.test_ssh_connection(),
                         }
                     )
                     return
@@ -3000,23 +3398,26 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
-    if not args.batch_root:
-        print("ERROR: 必须提供 --batch-root 或 GEO_RING_TRANSFER_BATCH_ROOT。", file=sys.stderr)
+    apply_to_environment()
+    persisted = load_settings()
+    batch_root_str = args.batch_root or str(persisted.get("download_root", "") or "")
+    if not batch_root_str:
+        print("ERROR: 必须提供 --batch-root 或在设置页面配置下载路径。", file=sys.stderr)
         return 2
-    batch_root = Path(args.batch_root)
+    batch_root = Path(batch_root_str)
     if not batch_root.is_dir():
         print("ERROR: 批次目录不存在：{}".format(batch_root), file=sys.stderr)
         return 2
-    identity_file = Path(args.identity_file).expanduser() if args.identity_file else None
+    identity_file = Path(args.identity_file).expanduser() if args.identity_file else (Path(persisted["identity_file"]).expanduser() if persisted.get("identity_file") else None)
     state = DashboardState(
         batch_root,
-        ssh_target=args.ssh_target,
+        ssh_target=args.ssh_target or str(persisted.get("ssh_target", "")),
         identity_file=identity_file,
-        auto_upload_root=args.auto_upload_root,
-        allowed_server_parent=args.allowed_server_parent,
-        conda_environment=args.conda_environment,
-        notification_setup_sender=args.notification_setup_sender,
-        notification_setup_recipient=args.notification_setup_recipient,
+        auto_upload_root=args.auto_upload_root or str(persisted.get("server_root", "")),
+        allowed_server_parent=args.allowed_server_parent or str(persisted.get("allowed_server_parent", "")),
+        conda_environment=args.conda_environment or str(persisted.get("conda_environment", "pytorch")),
+        notification_setup_sender=args.notification_setup_sender or str(persisted.get("smtp_sender", "")),
+        notification_setup_recipient=args.notification_setup_recipient or str(persisted.get("smtp_recipient", "")),
     )
     state.start_notification_monitor()
     state.start_batch_queue_scheduler()
