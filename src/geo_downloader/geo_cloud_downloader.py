@@ -2531,9 +2531,12 @@ def run_validate(root: Path) -> None:
             duplicate_rows.extend([seen[key], row])
         else:
             seen[key] = row
-        ok, note = validate_file(Path(local_path), row)
-        if not ok:
-            corrupt_rows.append({**row, "note": note})
+        p = Path(local_path)
+        if not p.exists():
+            corrupt_rows.append({**row, "note": "missing_local_file"})
+            continue
+        if p.stat().st_size <= 0:
+            corrupt_rows.append({**row, "note": "empty_file"})
 
     write_csv(manifest_path(root, "missing_targets.csv"), missing_rows)
     write_csv(manifest_path(root, "corrupt_files.csv"), corrupt_rows)
