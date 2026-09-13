@@ -1507,7 +1507,7 @@ def run_download_meteosat_range(
             if os.environ.get("GEO_CLOUD_FAST_SKIP_EXISTING", "").strip() == "1" and local.stat().st_size > 0:
                 ok, note = True, "fast_skip_existing_size_gt_0"
             else:
-                ok, note = validate_file(local, row)
+                ok, note = validate_file_fast(local, row)
             if ok:
                 out = dict(row)
                 out["status"] = "downloaded"
@@ -1645,7 +1645,7 @@ def run_download_epic_range(
             if os.environ.get("GEO_CLOUD_FAST_SKIP_EXISTING", "").strip() == "1" and local.stat().st_size > 0:
                 ok, note = True, "fast_skip_existing_size_gt_0"
             else:
-                ok, note = validate_file(local, row)
+                ok, note = validate_file_fast(local, row)
             if ok:
                 out = dict(row)
                 out["status"] = "downloaded"
@@ -2059,6 +2059,15 @@ def enough_free_space(root: Path, rows: list[dict], multiplier: float = 1.2) -> 
     }
 
 
+def validate_file_fast(path: Path, row: Optional[dict] = None) -> tuple[bool, str]:
+    """Fast existence + size check only. Used for skip-existing during download resume."""
+    if not path.exists():
+        return False, "missing_local_file"
+    if path.stat().st_size <= 0:
+        return False, "empty_file"
+    return True, "size_ok"
+
+
 def validate_file(path: Path, row: Optional[dict] = None) -> tuple[bool, str]:
     if not path.exists():
         return False, "missing_local_file"
@@ -2433,7 +2442,7 @@ def run_download_s3_range(
     for row in rows:
         local = Path(row["local_path"])
         if local.exists():
-            ok, note = validate_file(local, row)
+            ok, note = validate_file_fast(local, row)
             if ok:
                 out = dict(row)
                 out["status"] = "downloaded"
