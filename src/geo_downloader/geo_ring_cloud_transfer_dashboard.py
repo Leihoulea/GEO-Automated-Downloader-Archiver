@@ -111,6 +111,11 @@ FY4B_OFFICIAL_FILENAME_RE = re.compile(
     r"(?P<product>[A-Z0-9]+)-_.+?_NOM_(?P<nominal_time>\d{14})_\d{14}_.+\.NC$",
     re.IGNORECASE,
 )
+FY4B_GEO_FILENAME_RE = re.compile(
+    r"^FY4B-_AGRI--_N_DISK_1050E_L1-_"
+    r"GEO-.+?_NOM_(?P<nominal_time>\d{14})_\d{14}_.+\.HDF$",
+    re.IGNORECASE,
+)
 ORDER_SOURCE_CONFIG = {
     "CLAAS3-0deg": {
         "display_name": "CLAAS-3（CM SAF）",
@@ -1234,9 +1239,11 @@ class DashboardState:
                     or candidate.suffix.lower() == ".part"
                 ):
                     continue
-                if candidate.suffix.lower() != ".nc":
+                if candidate.suffix.lower() not in (".nc", ".hdf"):
                     continue
                 match = FY4B_OFFICIAL_FILENAME_RE.fullmatch(candidate.name)
+                if not match:
+                    match = FY4B_GEO_FILENAME_RE.fullmatch(candidate.name)
                 if not match:
                     rejected.append(relative.as_posix())
                     continue
@@ -1246,7 +1253,7 @@ class DashboardState:
                 except ValueError:
                     rejected.append(relative.as_posix())
                     continue
-                product = match.group("product").upper()
+                product = match.group("product").upper() if "product" in match.groupdict() else "GEO"
                 remote_relative_path = PurePosixPath(
                     "FY4B",
                     product,
@@ -1280,7 +1287,7 @@ class DashboardState:
             examples = "；".join(rejected[:5])
             suffix = "（仅显示前 5 个）" if len(rejected) > 5 else ""
             raise RuntimeError(
-                "发现 {} 个 .NC 文件不符合 FY4B AGRI L2 官方命名规则，无法安全判断变量、日期和小时：{}{}".format(
+                "发现 {} 个 .NC/.HDF 文件不符合 FY4B AGRI 官方命名规则，无法安全判断变量、日期和小时：{}{}".format(
                     len(rejected), examples, suffix
                 )
             )
@@ -1328,7 +1335,7 @@ class DashboardState:
             raise RuntimeError("FY4B 来源不能是整个 GEO_Cloud_2024_batches 父目录。")
         records = self._fy4b_source_files(source_root)
         if not records:
-            raise RuntimeError("FY4B 来源目录中未发现符合命名规则的已完成 .NC 文件。")
+            raise RuntimeError("FY4B 来源目录中未发现符合命名规则的已完成 .NC/.HDF 文件。")
         products = []
         for product in sorted({str(row["product"]) for row in records}):
             product_rows = [row for row in records if row["product"] == product]

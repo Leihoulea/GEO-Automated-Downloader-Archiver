@@ -181,6 +181,7 @@
       <div class="top-actions">
         <span class="live"><span class="pulse"></span><span id="updated">连接中</span></span>
         <button class="button" id="notificationButton" type="button">开启电脑通知</button>
+        <button class="button" id="settingsButton" type="button">⚙ 设置</button>
         <a class="ghost" href="/guide" target="_blank" rel="noopener">中文操作说明</a>
         <button class="button" id="refreshButton" type="button">立即刷新</button>
       </div>
@@ -197,6 +198,64 @@
         <div class="field"><label for="emailClientPassword">中科大客户端专用密码</label><input id="emailClientPassword" type="password" autocomplete="new-password" required></div>
         <div class="security-note">密码只发送到本机 127.0.0.1，由 Windows DPAPI 按当前用户加密；不会进入任务日志、项目代码或 Git。保存后会立即发送一封测试邮件。</div>
         <div class="dialog-actions"><button class="button" id="cancelEmailConfig" type="button">取消</button><button class="button primary" id="saveEmailConfig" type="submit">安全保存并测试</button></div>
+      </form>
+    </dialog>
+
+    <dialog id="settingsDialog" style="min-width:560px;max-width:90vw;max-height:90vh;overflow-y:auto">
+      <form class="dialog-body" id="settingsForm" autocomplete="off">
+        <h2>⚙ 全局设置</h2>
+        <div class="hint">所有配置保存在本机（密码经 Windows DPAPI 加密），重启后自动加载。环境变量优先于此处设置。</div>
+
+        <h3 style="margin-top:18px;border-bottom:1px solid var(--border);padding-bottom:4px">SSH 上传</h3>
+        <div class="hint" style="margin-bottom:10px;line-height:1.7">
+          <b>用途：</b>把下载好的卫星数据通过 SFTP 自动上传到实验室服务器。<br>
+          <b>什么是 SSH 密钥？</b>密钥分两把——私钥（存在你电脑上，保密）和公钥（放到服务器上）。两边配对上就能免密登录，不用每次输密码。<code>ed25519</code> 是一种加密算法名，比老式的 RSA 更快更安全。<br>
+          <b>配置步骤（只需做一次）：</b><br>
+          1. 在本机打开 PowerShell / CMD，运行以下命令生成密钥对（一路回车即可，不设口令最省事）：<br>
+          <code>&nbsp;&nbsp;ssh-keygen -t ed25519 -f C:\Users\你的用户名\.ssh\id_ed25519_server</code><br>
+          这会在 <code>C:\Users\你的用户名\.ssh\</code> 下生成两个文件：<code>id_ed25519_server</code>（私钥）和 <code>id_ed25519_server.pub</code>（公钥）<br>
+          2. 把公钥贴到服务器上（会要求输一次服务器密码）：<br>
+          <code>&nbsp;&nbsp;ssh-copy-id -i C:\Users\你的用户名\.ssh\id_ed25519_server.pub 用户名@服务器IP</code><br>
+          3. 测试免密登录（如果不用输密码就成功了）：<br>
+          <code>&nbsp;&nbsp;ssh -i C:\Users\你的用户名\.ssh\id_ed25519_server 用户名@服务器IP</code><br>
+          4. 在下方填写：服务器地址（格式 <code>用户名@IP</code>）、私钥文件完整路径、服务器上的归档目录<br>
+          5. 点"测试 SSH 连接"确认能免密连上<br>
+          <b>如果设了私钥口令：</b>需先运行 <code>ssh-agent</code> 和 <code>ssh-add</code> 解锁，否则自动上传无法免密登录。没设口令可跳过。<br>
+          <b>安全护栏：</b>归档目录必须是"允许的父目录"的子目录，防止误写其他位置。
+        </div>
+        <div class="field"><label for="setSshTarget">服务器地址</label><input id="setSshTarget" type="text" placeholder="user@210.45.127.28"></div>
+        <div class="field"><label for="setIdentityFile">私钥文件路径</label><input id="setIdentityFile" type="text" placeholder="C:\\Users\\me\\.ssh\\id_ed25519_server"></div>
+        <div class="field"><label for="setServerRoot">服务器归档目录</label><input id="setServerRoot" type="text" placeholder="/data04/1/dhr/geo_ring_cloud_auto_upload"></div>
+        <div class="field"><label for="setAllowedParent">允许的服务器父目录（安全护栏）</label><input id="setAllowedParent" type="text" placeholder="/data04/1/dhr"></div>
+        <div style="margin:8px 0"><button class="button" id="testSshButton" type="button">测试 SSH 连接</button> <span id="sshTestResult" style="font-size:13px"></span></div>
+
+        <h3 style="margin-top:18px;border-bottom:1px solid var(--border);padding-bottom:4px">下载路径</h3>
+        <div class="field"><label for="setDownloadRoot">下载根目录</label><input id="setDownloadRoot" type="text" placeholder="E:\\GEO_Cloud_2024_batches"></div>
+
+        <h3 style="margin-top:18px;border-bottom:1px solid var(--border);padding-bottom:4px">EUMETSAT 凭据 <span style="font-weight:normal;color:var(--muted)">（可选，仅下载 Meteosat 卫星数据时需要）</span></h3>
+        <div class="hint" style="margin-bottom:8px">在 <a href="https://eoportal.eumetsat.int/" target="_blank" rel="noopener">EUMETSAT EO Portal</a> 注册后获取 Consumer Key / Secret。不下载 Meteosat 可留空。</div>
+        <div class="field"><label for="setEumetsatKey">Consumer Key</label><input id="setEumetsatKey" type="text"></div>
+        <div class="field"><label for="setEumetsatSecret">Consumer Secret</label><input id="setEumetsatSecret" type="password"></div>
+
+        <h3 style="margin-top:18px;border-bottom:1px solid var(--border);padding-bottom:4px">NASA Earthdata 凭据 <span style="font-weight:normal;color:var(--muted)">（可选，仅下载 DSCOVR EPIC 数据时需要）</span></h3>
+        <div class="hint" style="margin-bottom:8px">在 <a href="https://urs.earthdata.nasa.gov/" target="_blank" rel="noopener">NASA Earthdata Login</a> 注册并批准 ASDC 应用。不下载 EPIC 可留空。</div>
+        <div class="field"><label for="setEarthdataUser">用户名</label><input id="setEarthdataUser" type="text" placeholder="kingofkunlun"></div>
+        <div class="field"><label for="setEarthdataPass">密码</label><input id="setEarthdataPass" type="password"></div>
+
+        <h3 style="margin-top:18px;border-bottom:1px solid var(--border);padding-bottom:4px">邮件通知 <span style="font-weight:normal;color:var(--muted)">（可选）</span></h3>
+        <div class="field"><label for="setSmtpHost">SMTP 服务器</label><input id="setSmtpHost" type="text" placeholder="mail.ustc.edu.cn"></div>
+        <div class="field"><label for="setSmtpPort">端口</label><input id="setSmtpPort" type="number" value="465"></div>
+        <div class="field"><label for="setSmtpUser">SMTP 用户名（发件邮箱）</label><input id="setSmtpUser" type="text"></div>
+        <div class="field"><label for="setSmtpPass">SMTP 密码</label><input id="setSmtpPass" type="password"></div>
+        <div class="field"><label for="setSmtpSender">发件地址</label><input id="setSmtpSender" type="email"></div>
+        <div class="field"><label for="setSmtpRecipient">收件地址</label><input id="setSmtpRecipient" type="email"></div>
+        <div class="field" style="display:flex;gap:16px;flex-wrap:wrap">
+          <label><input id="setSmtpSsl" type="checkbox" checked> SSL</label>
+          <label><input id="setSmtpStarttls" type="checkbox"> STARTTLS</label>
+        </div>
+
+        <div class="security-note">所有密码只发送到本机 127.0.0.1，由 Windows DPAPI 按当前用户加密存储。不进入日志、代码或 Git。</div>
+        <div class="dialog-actions"><button class="button" id="cancelSettings" type="button">取消</button><button class="button primary" id="saveSettings" type="submit">保存设置</button></div>
       </form>
     </dialog>
 
@@ -235,7 +294,7 @@
       <div id="productSelector" style="margin:10px 0;padding:8px 12px;border:1px solid var(--line);border-radius:10px;background:#faf9f4;display:none"></div>
       <div class="launch-actions">
         <div class="launch-note"><label><input id="refreshInventory" type="checkbox"> 强制刷新清单（通常不勾选，重复任务会复用缓存）</label><br><label><input id="adaptiveDownload" type="checkbox" checked> 下载自动调速：从 4 路开始，依据实际吞吐与错误率逐级升降（上限由上方选择）</label><br><label><input id="continuousUpload" type="checkbox" checked> 全自动流水线：下载时单路上传，下载结束后自动按 2→3→4 路提速，并执行服务器 SHA-256 全量复核</label><br>网络模式固定为 <b>direct_only</b>，任务不会自动删除本地文件。<span id="notificationStatus">邮件通知未配置</span>。CLAAS-3 是 CM SAF 订单型数据源，须先登录官方页面下单，不能在此处伪装成直接下载。</div>
-        <div><button class="button" id="configureEmailButton" type="button">配置邮件</button> <button class="button" id="testEmailButton" type="button" disabled>发送测试邮件</button> <button class="button" id="enqueueDownloadButton" type="button">加入空间感知队列</button> <button class="button primary" id="startDownloadButton" type="button">立即创建并启动</button></div>
+        <div><button class="button" id="configureEmailButton" type="button">配置邮件</button> <button class="button" id="testEmailButton" type="button" disabled>发送测试邮件</button> <button class="button" id="enqueueDownloadButton" type="button">加入空间感知队列</button> <button class="button primary" id="startDownloadButton" type="button">立即创建并启动</button> <button class="button" id="stopDownloadButton" type="button" style="display:none;background:#c0392b;color:#fff;border-color:#922b21">⏹ 停止下载</button> <button class="button" id="resumeDownloadButton" type="button" style="display:none;background:#26845b;color:#fff;border-color:#1e6b47">▶ 恢复下载</button></div>
       </div>
     </section>
 
@@ -245,7 +304,7 @@
         <div class="field" style="grid-column:span 3"><label for="fy4bSourcePath">FY4B 官方应用下载目录</label><input id="fy4bSourcePath" type="text" placeholder="粘贴官方应用的文件夹路径，例如 F:\\FY4B_official_download"></div>
         <div class="field" style="grid-column:span 2"><label for="fy4bBatchLabel">FY4B 自动批次标识</label><output id="fy4bBatchLabel">填写目录后自动生成</output></div>
       </div>
-      <div class="launch-actions"><div class="launch-note">仅接受 FY4B AGRI L2 官方命名的 <code>.NC</code> 文件，并从文件名校验变量、日期与小时；不符合规则的文件不会上传。请先点击“预览映射”。服务端路径固定为 <code>…/FY4B/变量/YYYYMMDD/HH/原始文件名</code>；上传器会在后台计算 SHA-256、断点续传和服务器复核，不会复制、移动或删除原始文件。</div><div><button class="button" id="previewFy4bUploadButton" type="button">预览 FY4B 映射</button> <button class="button primary" id="startFy4bUploadButton" type="button">创建 FY4B 上传批次</button></div></div>
+      <div class="launch-actions"><div class="launch-note">仅接受 FY4B AGRI 官方命名的 <code>.NC</code>（L2 产品）和 <code>.HDF</code>（L1 GEO）文件，并从文件名校验变量、日期与小时；不符合规则的文件不会上传。请先点击“预览映射”。服务端路径固定为 <code>…/FY4B/变量/YYYYMMDD/HH/原始文件名</code>；上传器会在后台计算 SHA-256、断点续传和服务器复核，不会复制、移动或删除原始文件。</div><div><button class="button" id="previewFy4bUploadButton" type="button">预览 FY4B 映射</button> <button class="button primary" id="startFy4bUploadButton" type="button">创建 FY4B 上传批次</button></div></div>
       <div class="fy4b-preview" id="fy4bPreviewPanel" hidden aria-live="polite">
         <div class="section-head"><h3>FY4B 映射预览</h3><div><button class="button" id="copyFy4bPreviewButton" type="button">复制路径</button> <button class="button" id="closeFy4bPreviewButton" type="button">关闭预览</button></div></div>
         <div class="fy4b-preview-grid" id="fy4bPreviewSummary"></div>
@@ -360,7 +419,7 @@
     let notificationSetupToken = '';
     const stateNames = {
       running: "本地处理中", blocked: "服务器复核失败", ready_for_xftp: "等待上传",
-      launch_failed: "批次启动失败",
+      launch_failed: "批次启动失败", stopped: "已停止",
       auto_uploading: "自动上传中", upload_failed: "自动上传失败",
       awaiting_server_verification: "等待服务器复核", server_verified: "服务器已验证",
       cleanup_approved: "已批准清理（未删除）"
@@ -386,9 +445,11 @@
       const all=(tasks || []).slice().sort((a,b) => (b.batch_name||'').localeCompare(a.batch_name||''));
       const isDone=t=>t.server_status==='PASS' || (t.upload_status==='PASS' && t.download_status==='COMPLETE');
       const isFailed=t=>['FAIL','FAILED'].includes(t.download_status) && !isDone(t);
-      const active=all.filter(t=>!isDone(t) && !isFailed(t));
+      const isStopped=t=>t.download_status==='STOPPED' && !isDone(t);
+      const active=all.filter(t=>!isDone(t) && !isFailed(t) && !isStopped(t));
       const done=all.filter(isDone);
       const failed=all.filter(isFailed);
+      const stopped=all.filter(isStopped);
       const renderRow=task=>{
         const selected=task.batch_name===selectedBatchName;
         const gate=task.disk_gate?.exists
@@ -396,7 +457,7 @@
             ? '上次因空间不足失败；当前空间已满足，可重新启动'
             : `磁盘不足，当前还差 ${esc(task.disk_gate.current_shortfall_label || task.disk_gate.shortfall_label || '--')}`
           : '';
-        const error=gate || (['FAIL','failed'].includes(task.download_status) ? task.error : '');
+        const error=gate || (['FAIL','failed','STOPPED'].includes(task.download_status) ? task.error : '');
         return `<button class="task-item ${selected?'selected':''}" type="button" data-batch="${esc(task.batch_name)}">
           <span class="task-main"><b>${esc(task.batch_name)}</b><span>${esc((task.platforms || []).join(' · ') || '平台待确认')}</span>${error?`<span class="task-error">${esc(error)}</span>`:''}</span>
           <span class="task-kpi"><b>${esc(taskStatus(task.download_status))}</b><span>下载 · ${esc(task.download_phase || 'waiting')}</span></span>
@@ -404,8 +465,9 @@
           <span class="task-kpi"><b>${esc(taskStatus(task.server_status))}</b><span>服务器复核</span></span>
         </button>`;
       };
-      $('taskList').innerHTML=active.length ? active.map(renderRow).join('') : '<div class="empty">没有活动或待处理任务；已完成和失败批次在下方折叠。</div>';
+      $('taskList').innerHTML=active.length ? active.map(renderRow).join('') : '<div class="empty">没有活动或待处理任务；已完成、已停止和失败批次在下方折叠。</div>';
       let html='';
+      if(stopped.length){ html+=`<details class="task-archive" data-archive-key="stopped" style="margin-top:14px"${_taskArchiveOpen.stopped?' open':''}><summary style="cursor:pointer;padding:10px 0;color:var(--muted);font-weight:700">已停止批次（${nf.format(stopped.length)}，可恢复）</summary><div class="task-list">${stopped.map(renderRow).join('')}</div></details>`; }
       if(failed.length){ html+=`<details class="task-archive" data-archive-key="failed" style="margin-top:14px"${_taskArchiveOpen.failed?' open':''}><summary style="cursor:pointer;padding:10px 0;color:var(--muted);font-weight:700">失败批次（${nf.format(failed.length)}）</summary><div class="task-list">${failed.map(renderRow).join('')}</div></details>`; }
       if(done.length){ html+=`<details class="task-archive" data-archive-key="done" style="margin-top:14px"${_taskArchiveOpen.done?' open':''}><summary style="cursor:pointer;padding:10px 0;color:var(--muted);font-weight:700">已完成批次（${nf.format(done.length)}，默认折叠）</summary><div class="task-list">${done.map(renderRow).join('')}</div></details>`; }
       $('taskList').innerHTML+=html;
@@ -416,7 +478,7 @@
       }));
     }
     function queueStatus(value){
-      return ({QUEUED:'等待调度',WAITING_ACTIVE_DOWNLOAD:'等待当前下载',WAITING_SPACE:'等待磁盘空间',STARTING:'正在启动',RUNNING:'下载中',COMPLETE:'已完成',FAILED:'失败',CANCELLED:'已取消'})[value] || value || '未知';
+      return ({QUEUED:'等待调度',WAITING_ACTIVE_DOWNLOAD:'等待当前下载',WAITING_SPACE:'等待磁盘空间',STARTING:'正在启动',RUNNING:'下载中',COMPLETE:'已完成',FAILED:'失败',STOPPED:'已停止',CANCELLED:'已取消'})[value] || value || '未知';
     }
     function renderBatchQueue(queue){
       const items=queue?.items || [];
@@ -547,8 +609,11 @@
         $("batchRoot").textContent = data.batch_root;
         $("overallState").textContent = stateNames[data.overall_state] || data.overall_state;
         const batchRunning=(data.tasks || []).some(task=>['STARTING','RUNNING'].includes(task.download_status));
+        const batchStopped=(data.tasks || []).some(task=>['STOPPED'].includes(task.download_status));
         $("startDownloadButton").disabled=batchRunning;
-        $("startDownloadButton").title=batchRunning?'已有下载正在运行；可使用“加入空间感知队列”自动续批':'';
+        $("startDownloadButton").title=batchRunning?'已有下载在运行；可停止后重新启动':'';
+        $("stopDownloadButton").style.display=batchRunning?'inline-block':'none';
+        $("resumeDownloadButton").style.display=(!batchRunning && batchStopped)?'inline-block':'none';
         const download=data.download.combined || {}, disk=data.disk || {}, parts=data.active_parts || {items:[]}, downloadParallel=data.download.parallelism || {};
         $("downloadPercent").textContent=pct(download.percent); setWidth('downloadMiniBar',download.percent);
         $("fileCount").textContent=`${nf.format(download.overall_completed || 0)} / ${nf.format(download.total || 0)}`;
@@ -727,6 +792,17 @@
       const button=$("startDownloadButton"); button.disabled=true;
       try{const data=await postJson('/api/actions/start-download',payload);selectedBatchName=data.download.batch_name;await refresh();toast((data.download.continuous_upload?'全自动批次':'下载批次')+'已在后台启动：'+data.download.batch_root);}catch(error){toast(error.message);}finally{button.disabled=false;}
     });
+    $("stopDownloadButton").addEventListener('click',async()=>{
+      if(!confirm('确认停止当前批次？\n• 下载进程将被终止，已下载的文件保留\n• 上传进程（如正在运行）也会被停止，已上传的文件保留\n• 正在下载的单个文件留下 .part 临时文件，下次可续传\n• 不会删除任何数据')) return;
+      const button=$("stopDownloadButton"); button.disabled=true;
+      try{const data=await postAction('/api/actions/stop-download',{batch_name:selectedBatchName});toast(data.stop?.message || '批次已停止');}catch(error){toast(error.message);}finally{button.disabled=false;}
+    });
+    $("resumeDownloadButton").addEventListener('click',async()=>{
+      const dlWorkers=parseInt($("downloadWorkers").value) || 12;
+      if(!confirm('恢复下载批次 '+selectedBatchName+'？\n• 已下载完成的文件会自动跳过\n• 未完成的 .part 文件会续传\n• 使用原始批次的日期和平台参数，无需重新填写\n• 并行上限将使用当前选择：'+dlWorkers+' 路')) return;
+      const button=$("resumeDownloadButton"); button.disabled=true;
+      try{const data=await postJson('/api/actions/resume-download',{batch_name:selectedBatchName,download_workers:dlWorkers,adaptive_download:$("adaptiveDownload").checked,continuous_upload:$("continuousUpload").checked});selectedBatchName=data.download.batch_name;await refresh();toast('批次已恢复下载：'+data.download.batch_root);}catch(error){toast(error.message);}finally{button.disabled=false;}
+    });
     let lastFy4bPreview=null;
     function renderFy4bPreview(preview){
       const products=(preview.products||[]).map(product=>`<div class="fy4b-preview-kpi"><b>${esc(product.product)}</b><span>${nf.format(product.file_count||0)} 文件 · ${fmtBytes(product.size_bytes)}<br>${esc(product.first_nominal_time||'--')} 至 ${esc(product.last_nominal_time||'--')}</span></div>`).join('');
@@ -770,6 +846,81 @@
     $("cleanupButton").addEventListener('click',async()=>{ if(!confirm('确认服务器验证为 PASS，并允许后续单独执行本地清理？本按钮本身不会删除数据。')) return; try{await postAction('/api/actions/approve-cleanup',{batch_name:selectedBatchName});toast('已记录清理许可；尚未删除任何文件');}catch(error){toast(error.message);} });
     $("openCleanupFolderButton").addEventListener('click',async()=>{ try{const data=await postAction('/api/actions/open-cleanup-folder',{batch_name:selectedBatchName});toast('已打开本地批次文件夹：'+(data.folder?.folder || ''));}catch(error){toast(error.message);} });
     $("copyCommand").addEventListener('click',async()=>{ try{await navigator.clipboard.writeText($("serverCommand").textContent);toast('服务器验证命令已复制');}catch(_){toast('浏览器未允许复制，请手工选择命令');} });
+
+    // === Settings dialog ===
+    $("settingsButton").addEventListener('click', async () => {
+      try {
+        const data = await postJson('/api/actions/get-settings', {});
+        const s = data.settings || {};
+        $("setSshTarget").value = s.ssh_target || '';
+        $("setIdentityFile").value = s.identity_file || '';
+        $("setServerRoot").value = s.server_root || '';
+        $("setAllowedParent").value = s.allowed_server_parent || '';
+        $("setDownloadRoot").value = s.download_root || '';
+        $("setEumetsatKey").value = s.eumetsat_consumer_key === '********' ? '' : (s.eumetsat_consumer_key || '');
+        $("setEumetsatSecret").value = '';
+        $("setEarthdataUser").value = s.earthdata_username || '';
+        $("setEarthdataPass").value = '';
+        $("setSmtpHost").value = s.smtp_host || '';
+        $("setSmtpPort").value = s.smtp_port || 465;
+        $("setSmtpUser").value = s.smtp_user || '';
+        $("setSmtpPass").value = '';
+        $("setSmtpSender").value = s.smtp_sender || '';
+        $("setSmtpRecipient").value = s.smtp_recipient || '';
+        $("setSmtpSsl").checked = s.smtp_ssl !== false;
+        $("setSmtpStarttls").checked = s.smtp_starttls === true;
+        $("sshTestResult").textContent = '';
+      } catch (error) { toast(error.message); }
+      $("settingsDialog").showModal();
+    });
+    $("cancelSettings").addEventListener('click', () => { $("settingsDialog").close(); });
+    $("testSshButton").addEventListener('click', async () => {
+      $("sshTestResult").textContent = '测试中...';
+      try {
+        // Save first so backend has latest values
+        await saveSettingsFromForm();
+        const data = await postAction('/api/actions/test-ssh');
+        const r = data.ssh || {};
+        $("sshTestResult").textContent = r.status === 'PASS' ? '✓ 连接成功' : '✗ ' + (r.error || '失败');
+        $("sshTestResult").style.color = r.status === 'PASS' ? '#26845b' : '#c0392b';
+      } catch (error) {
+        $("sshTestResult").textContent = '✗ ' + error.message;
+        $("sshTestResult").style.color = '#c0392b';
+      }
+    });
+    async function saveSettingsFromForm() {
+      const payload = {
+        ssh_target: $("setSshTarget").value.trim(),
+        identity_file: $("setIdentityFile").value.trim(),
+        server_root: $("setServerRoot").value.trim(),
+        allowed_server_parent: $("setAllowedParent").value.trim(),
+        download_root: $("setDownloadRoot").value.trim(),
+        eumetsat_consumer_key: $("setEumetsatKey").value.trim(),
+        eumetsat_consumer_secret: $("setEumetsatSecret").value,
+        earthdata_username: $("setEarthdataUser").value.trim(),
+        earthdata_password: $("setEarthdataPass").value,
+        smtp_host: $("setSmtpHost").value.trim(),
+        smtp_port: parseInt($("setSmtpPort").value) || 465,
+        smtp_user: $("setSmtpUser").value.trim(),
+        smtp_password: $("setSmtpPass").value,
+        smtp_sender: $("setSmtpSender").value.trim(),
+        smtp_recipient: $("setSmtpRecipient").value.trim(),
+        smtp_ssl: $("setSmtpSsl").checked,
+        smtp_starttls: $("setSmtpStarttls").checked,
+      };
+      const data = await postJson('/api/actions/save-settings', payload);
+      return data.settings;
+    }
+    $("settingsForm").addEventListener('submit', async (e) => {
+      e.preventDefault();
+      try {
+        await saveSettingsFromForm();
+        toast('设置已保存（密码经 DPAPI 加密）');
+        $("settingsDialog").close();
+        await refresh();
+      } catch (error) { toast(error.message); }
+    });
+
     updateNotificationButton(); refresh(); setInterval(refresh,5000);
   </script>
 </body>
