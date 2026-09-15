@@ -1498,6 +1498,47 @@ class DashboardState:
         return result
 
     @staticmethod
+    def _task_summary_lite(batch_root: Path, raw: Dict, launcher_raw: Dict, upload_raw: Dict) -> Dict[str, object]:
+        """Lightweight summary without rglob or heartbeat checks. For completed batches."""
+        xftp = marker_status(batch_root / "transfer" / "xftp_upload_complete.json")
+        server = server_verification_status(batch_root / "transfer")
+        download_status = str(raw.get("status", launcher_raw.get("status", "UNKNOWN"))).upper()
+        if download_status == "COMPLETE" or raw.get("status") == "complete":
+            download_status = "COMPLETE"
+        elif download_status in {"FAIL", "FAILED"} or raw.get("status") == "failed":
+            download_status = "FAIL"
+        upload_status = str(upload_raw.get("status", "PENDING"))
+        if xftp.get("payload", {}).get("status") == "AUTOMATED_SFTP_COMPLETE":
+            upload_status = "PASS"
+        updated_candidates = [
+            str(raw.get("updated_at", "")),
+            str(launcher_raw.get("updated_at", "")),
+            str(upload_raw.get("updated_at", "")),
+            str(server.get("verified_at", "")),
+        ]
+        return {
+            "batch_name": batch_root.name,
+            "batch_root": str(batch_root),
+            "start_date": raw.get("start_date", launcher_raw.get("start_date", "")),
+            "end_date": raw.get("end_date", launcher_raw.get("end_date", "")),
+            "platforms": raw.get("platforms", launcher_raw.get("platforms", [])),
+            "download_status": download_status,
+            "download_phase": raw.get("phase", "waiting"),
+            "download_process_alive": False,
+            "upload_status": upload_status,
+            "upload_phase": upload_raw.get("phase", "waiting"),
+            "upload_completed_files": int(upload_raw.get("completed_files", 0) or 0),
+            "upload_file_count": int(upload_raw.get("file_count", 0) or 0),
+            "upload_percent": float(upload_raw.get("percent", 0) or 0),
+            "server_status": str(server.get("status", "PENDING")),
+            "transfer_status": str(transfer_manifest_status(batch_root / "transfer").get("status", "PENDING")),
+            "error": "",
+            "disk_gate": {"exists": False, "message": ""},
+            "updated_at": max(updated_candidates),
+            "automatic_delete": False,
+        }
+
+    @staticmethod
     def _task_summary(batch_root: Path) -> Dict[str, object]:
         transfer_dir = batch_root / "transfer"
         raw = read_json(transfer_dir / "batch_status.json")
@@ -1557,6 +1598,18 @@ class DashboardState:
             for batch_root in directories:
                 transfer_dir = batch_root / "transfer"
                 if not transfer_dir.is_dir():
+                    continue
+                # Skip batches that are clearly done to avoid rglob on large dirs
+                raw = read_json(transfer_dir / "batch_status.json")
+                upload = read_json(transfer_dir / "auto_upload_status.json")
+                launcher = read_json(transfer_dir / "download_launcher_status.json")
+                is_done = (
+                    str(upload.get("status", "")).upper() in {"PASS", "FAIL", "FAILED"}
+                    or str(raw.get("status", "")) == "complete"
+                )
+                if is_done:
+                    # Lightweight summary without rglob
+                    tasks.append(self._task_summary_lite(batch_root, raw, launcher, upload))
                     continue
                 tasks.append(self._task_summary(batch_root))
         tasks.sort(key=lambda row: str(row.get("updated_at", "")), reverse=True)

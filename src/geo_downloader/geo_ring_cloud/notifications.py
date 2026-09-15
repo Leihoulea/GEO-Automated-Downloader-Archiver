@@ -39,7 +39,7 @@ EMAIL_ENV_KEYS = (
 )
 RETRY_DELAYS_SECONDS = (60, 300, 900, 3600, 10800)
 TERMINAL_STATES = {
-    "download": {"COMPLETE", "FAIL", "FAILED"},
+    "download": {"COMPLETE", "FAIL", "FAILED", "STOPPED"},
     "upload": {"PASS", "FAIL", "STOPPED", "STALLED"},
     "server": {"PASS", "FAIL"},
 }

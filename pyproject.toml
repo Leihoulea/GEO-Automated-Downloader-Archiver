@@ -13,6 +13,8 @@ dependencies = [
     "boto3>=1.34",
     "requests>=2.31",
     "psutil>=5.9",
+    "netCDF4>=1.6",
+    "eumdac>=2.0",
 ]
 
 [project.optional-dependencies]
@@ -20,8 +22,16 @@ test = [
     "pytest>=8.0",
 ]
 
+[project.scripts]
+geo-archiver-dashboard = "geo_downloader.geo_ring_cloud_transfer_dashboard:main"
+geo-archiver-download = "geo_downloader.geo_cloud_downloader:main"
+geo-archiver-upload = "geo_downloader.geo_ring_cloud_auto_uploader:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+geo_downloader = ["*.html", "*.md", "*.ps1"]
 
 [tool.pytest.ini_options]
 testpaths = ["src/geo_downloader/tests"]

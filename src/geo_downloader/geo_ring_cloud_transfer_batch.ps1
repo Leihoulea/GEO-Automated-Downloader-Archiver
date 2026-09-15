@@ -222,9 +222,31 @@ function Clear-DownloadProxy {
 }
 
 function Read-EumetsatCredentials {
+    # 1. Already in environment? Done.
+    if ($env:EUMETSAT_CONSUMER_KEY -and $env:EUMETSAT_CONSUMER_SECRET) { return }
+    # 2. Try the DPAPI dashboard settings store via a quick Python helper.
+    $pythonExe = if ($ResolvedPythonExe) { $ResolvedPythonExe } elseif ($GeoRingPythonExe) { $GeoRingPythonExe } else { "python" }
+    try {
+        $pyResult = & $pythonExe -c @"
+import sys, os, json
+sys.path.insert(0, r'$PSScriptRoot')
+from geo_ring_cloud.settings_store import load_settings
+s = load_settings()
+key = s.get('eumetsat_consumer_key','')
+secret = s.get('eumetsat_consumer_secret','')
+print(json.dumps({'key': key, 'secret': secret}))
+"@ 2>$null
+        $parsed = $pyResult | ConvertFrom-Json
+        if ($parsed.key -and $parsed.secret) {
+            $env:EUMETSAT_CONSUMER_KEY = $parsed.key
+            $env:EUMETSAT_CONSUMER_SECRET = $parsed.secret
+            return
+        }
+    } catch {}
+    # 3. Fall back to credential file.
     $CredentialFile = $GeoRingEumetsatCredentialsFile
     if (-not (Test-Path -LiteralPath $CredentialFile)) {
-        throw "EUMETSAT credential file not found: $CredentialFile"
+        throw "EUMETSAT credentials not found. Configure via dashboard Settings page or credential file: $CredentialFile"
     }
     $text = Get-Content -LiteralPath $CredentialFile -Raw
     $keyMatch = [regex]::Match($text, '(?im)^\s*Consumer\s+key\s*[:=]\s*(\S+)\s*$')
@@ -241,9 +263,26 @@ function Read-EarthdataCredentials {
         if (-not $env:EARTHDATA_USERNAME) { $env:EARTHDATA_USERNAME = 'kingofkunlun' }
         return
     }
+    # Try the DPAPI dashboard settings store via a quick Python helper.
+    $pythonExe = if ($ResolvedPythonExe) { $ResolvedPythonExe } elseif ($GeoRingPythonExe) { $GeoRingPythonExe } else { "python" }
+    try {
+        $pyResult = & $pythonExe -c @"
+import sys, json
+sys.path.insert(0, r'$PSScriptRoot')
+from geo_ring_cloud.settings_store import load_settings
+s = load_settings()
+print(json.dumps({'user': s.get('earthdata_username',''), 'pass': s.get('earthdata_password','')}))
+"@ 2>$null
+        $parsed = $pyResult | ConvertFrom-Json
+        if ($parsed.pass) {
+            $env:EARTHDATA_PASSWORD = $parsed.pass
+            $env:EARTHDATA_USERNAME = if ($parsed.user) { $parsed.user } else { 'kingofkunlun' }
+            return
+        }
+    } catch {}
     $CredentialFile = $GeoRingEarthdataCredentialsFile
     if (-not (Test-Path -LiteralPath $CredentialFile)) {
-        throw "EARTHDATA_PASSWORD not set and credential file not found: $CredentialFile. Either set the environment variable or create the file with 'username:' and 'password:' lines."
+        throw "EARTHDATA credentials not found. Configure via dashboard Settings page or credential file."
     }
     $text = Get-Content -LiteralPath $CredentialFile -Raw
     $userMatch = [regex]::Match($text, '(?im)^\s*username\s*[:=]\s*(\S+)\s*$')
