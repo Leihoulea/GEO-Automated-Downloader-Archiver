@@ -1,0 +1,409 @@
+# 工作记录：仪表盘 / 队列 I/O 压力治理（P0-1～P0-4）
+
+- 日期：2026-10-26
+- 仓库：`GEO-Automated-Downloader-Archiver`
+- 相关提交：
+  - `a24831a` `fix: reduce dashboard I/O load to prevent system instability`（上一版，已在 `origin/main`）
+  - `9a1f87e` `perf: reduce dashboard and queue scheduling I/O pressure`（本次，已 push）
+- 测试：`69 passed`
+- 数据安全：未修改任何自动删除策略；`automatic_delete` 仍为 `False`
+
+---
+
+## 1. 背景
+
+### 1.1 用户现象
+
+用户怀疑当前项目的设计会导致这台 Windows 电脑蓝屏重启，要求先做审计，再按 P0-1～P0-4 修复。
+
+### 1.2 系统日志证据
+
+Windows 系统日志中确认存在多次内核级 bugcheck，不是普通应用崩溃：
+
+| 日期 | Bugcheck | 含义 |
+|---|---|---|
+| 2026-10-26 | `0x20001` | HYPERVISOR_ERROR |
+| 2026-09-23 | `0x0000000A` | IRQL_NOT_LESS_OR_EQUAL |
+| 2026-09-16 | `0x0000003B` | SYSTEM_SERVICE_EXCEPTION |
+| 2026-09-15 | `0x0000001A (0x403)` | MEMORY_MANAGEMENT |
+| 2026-09-14 | `0x20001` | HYPERVISOR_ERROR |
+| 2026-07-31 | `0x00000050` | PAGE_FAULT_IN_NONPAGED_AREA |
+
+其中 `0x1A (0x403)` 与上一版提交 `a24831a` 中描述的 dashboard I/O 压力问题直接对应。
+
+### 1.3 硬件/环境要点
+
+- `F:` 数据盘位于机械硬盘（Disk 0，`ST4000DM004`）。
+- `C:` 系统盘位于 NVMe（`WD_BLACK SN7100`）。
+- 内存约 68 GB，20 个逻辑处理器。
+- 页面文件在 `C:`。
+- 系统里存在 10 个 `GeoRingCloud-*` 计划任务，其中多个指向旧副本
+  `D:\AAAresearch_paper\third_report\code\geo_cloud_download\...`，部分处于 `Ready` 且 `StartWhenAvailable=True`。
+
+### 1.4 关键判断
+
+Python 应用本身通常不能直接让内核崩溃。这些 bugcheck 更像是**内存/驱动/存储栈的潜在缺陷被持续高 I/O、海量 `stat`、内存抖动和线程堆积“压出来”**。机械盘 F: 放大了这种风险。
+
+因此本次工作有两个目标：
+
+1. 降低应用侧对磁盘、线程和隐藏子进程的持续压力。
+2. 为后续硬件/驱动排查留出清晰记录，避免把“应用慢”和“内核蓝屏”混为一谈。
+
+---
+
+## 2. 审计发现的高风险设计（P0）
+
+### P0-1 队列调度在持有全局锁时做全量扫描，HTTP 线程无上限
+
+- `geo_ring_cloud_transfer_dashboard.py` 的队列调度在 `_queue_lock` 内调用
+  `task_summaries()`、`_queue_estimate()`、`_queue_gate()`。
+- `/api/status` 请求又需要同一把 `_queue_lock`。
+- 服务端使用无并发上限的 `ThreadingHTTPServer`。
+- 当扫描变慢时，HTTP 线程不断堆积，每个线程随后又发起新一轮扫描，形成正反馈。
+
+### P0-2 每次状态刷新全量扫描，并重复读同一份清单 6 遍
+
+- `status()` 对同一份 `manifest_inventory.csv` 调用了 3 次 `read_inventory()`。
+- `summarize_download()` 内部又对同一清单调用 3 次 `read_manifest_sizes()`。
+- 每次刷新还会做 `.part` 全树 `rglob`、批次遍历和 A:\–Z:\ 盘符探测。
+- 设置/邮件状态每次刷新还会通过隐藏 PowerShell 做 DPAPI 解密。
+
+### P0-3 失败/停止批次没有被轻量摘要覆盖
+
+上一版只把 `upload PASS/FAIL` 或 `raw status == complete` 判为终态，导致：
+
+- 下载失败（`raw.status == "failed"`）
+- 用户停止（launcher `STOPPED`）
+- 上传 `STOPPED/STALLED`
+
+仍然走完整 `_task_summary()`，继续对大目录做 `rglob("*.part")`。
+
+### P0-4 排队估算每 15 秒对整张清单逐行 `stat`
+
+`batch_queue.refine_estimate_from_inventory()` 会对清单里每个 S3 行执行
+`local_path.is_file() and local_path.stat()`。该函数被每个等待队列项、每个 15 秒调度周期反复调用，在机械盘上形成随机 `stat` 风暴。
+
+---
+
+## 3. 本次修改内容（commit `9a1f87e`）
+
+### 3.1 P0-1：队列锁与 HTTP 线程
+
+文件：`src/geo_downloader/geo_ring_cloud_transfer_dashboard.py`
+
+- 重写 `_process_batch_queue_once_unlocked()`：
+  - 先在锁外完成 `task_summaries()`、`_queue_estimate()`、`_queue_gate()`。
+  - 只在锁内做轻量状态更新、启动决策和状态文件写入。
+- 队列为空或只有已完成项时直接返回，**空闲调度 tick 不再扫描批次**。
+- `_active_download_task(tasks=...)` 支持传入已扫描结果，避免重复扫描。
+- `_sync_launched_queue_items(state, tasks_by_name=...)` 复用同一次扫描结果。
+- 新增 `BoundedThreadingHTTPServer`，通过 `BoundedSemaphore` 限制并发 HTTP 线程数，默认 `MAX_HTTP_WORKERS = 8`。
+
+### 3.2 P0-2：减少重复读取和隐藏子进程
+
+文件：`src/geo_downloader/geo_ring_cloud_transfer_dashboard.py`
+
+- 新增 `read_inventory_by_remote_type()`：一次流式读取同一份清单，分别聚合
+  `s3`、`eumetsat`、`earthdata` 的统计结果，保持原有 result 形状。
+- `summarize_download(..., sizes=...)` 支持传入共享的 size map；`status()` 用
+  `sizes_for()` 对同一路径只读一次。
+- 清单读取从原来的约 6 遍降为 2 遍：
+  - 1 遍聚合 inventory 计数
+  - 1 遍读取 size map
+- 新增 `status_cached()`：
+  - `STATUS_CACHE_TTL_SECONDS = 8`
+  - 8 秒内复用同一份快照
+  - 计算期间持有 `_status_cache_lock`，并发标签页合并为一次扫描
+- `/api/status` 改为调用 `status_cached()`。
+- `do_POST()` 在请求前后都调用 `invalidate_status_cache()`，避免动作后看到旧页面。
+- 新增运行信息缓存：
+  - `_public_settings_cached()`
+  - `_notification_status_cached()`
+  - `RUNTIME_INFO_CACHE_TTL_SECONDS = 60`
+  - 设置/邮件状态不再每次刷新都通过隐藏 PowerShell 做 DPAPI 解密
+  - `update_settings()`、`configure_email()` 会清除缓存
+
+### 3.3 P0-3：失败/停止批次轻量摘要
+
+文件：`src/geo_downloader/geo_ring_cloud_transfer_dashboard.py`
+
+- `task_summaries()` 的终态集合扩展为：
+  - upload：`PASS`、`FAIL`、`FAILED`、`STOPPED`、`STALLED`
+  - raw：`complete`、`failed`
+  - launcher：`FAIL`、`FAILED`、`COMPLETE`、`COMPLETED`、`PASS`、`EXITED`、
+    `CANCELLED`、`CANCELED`、`STOPPED`
+- 终态批次只有在**下载心跳仍存活**时才走完整 `_task_summary()`；否则使用
+  `_task_summary_lite()`，避免 `rglob("*.part")`。
+- `_task_summary_lite()` 修正状态优先级：
+  - launcher `FAIL/STOPPED` 不会再被 `batch_status.json` 里过期的 `running` 覆盖。
+  - 轻量摘要返回真实 `error` 和 `parse_disk_gate(error)`。
+
+### 3.4 P0-4：排队估算缓存与节流
+
+文件：`src/geo_downloader/geo_ring_cloud/batch_queue.py`
+
+- 新增 `_collect_authoritative_inventory()`：
+  - 按清单文件 `(resolve_path, mtime_ns, size, platforms)` 缓存逐行统计结果。
+  - 清单不变时，不再对每个本地文件执行 `stat()`。
+  - 缓存上限 32 条，超过后清空。
+- `refine_estimate_from_inventory()` 改为使用上述缓存。
+- 文件：`geo_ring_cloud_transfer_dashboard.py`
+  - 新增 `ESTIMATE_REFRESH_SECONDS = 300`
+  - 等待队列项的估算最多每 300 秒刷新一次
+  - 新队列项 / 旧格式无时间戳的项仍会立即刷新
+
+### 3.5 额外安全改动
+
+- `BoundedThreadingHTTPServer` 给 HTTP 请求线程加了硬上限。
+- 空闲队列 tick 提前返回，避免无意义的批次扫描。
+- 以上改动都不改变自动删除策略，也不删除任何原始数据。
+
+---
+
+## 4. 测试与验证
+
+执行命令：
+
+```powershell
+python -m pytest -q
+```
+
+结果：
+
+```text
+69 passed
+```
+
+另有：
+
+```powershell
+python -m py_compile `
+  src\geo_downloader\geo_ring_cloud_transfer_dashboard.py `
+  src\geo_downloader\geo_ring_cloud\batch_queue.py `
+  src\geo_downloader\tests\test_geo_ring_cloud_transfer_batch.py
+```
+
+结果：编译通过。
+
+新增的回归测试覆盖：
+
+- `read_inventory_by_remote_type()` 单遍统计且分源计数正确
+- 失败终态批次使用轻量摘要，不触发完整扫描和 `rglob`
+- 失败批次存在新鲜下载心跳时仍使用完整摘要
+- launcher `STOPPED` 覆盖过期的 `running` 状态
+- `status_cached()` 在 TTL 内复用快照，失效后重新计算
+- 等待队列估算跨 tick 节流
+- 空闲队列 tick 不扫描批次
+- S3 inventory 估算缓存复用
+- HTTP 并发线程上限
+
+---
+
+## 5. 教训与经验
+
+### 5.1 不要在每个 HTTP 请求里做“全量事实查询”
+
+仪表盘的正确形态通常是：
+
+- 后台生成快照
+- 请求只读缓存
+- 明确的 TTL 和失效策略
+- 并发请求单飞（single-flight）
+
+“每个请求重新扫描所有批次”在数据量小的时候看不出问题，数据量一大就会演变成 I/O 风暴。
+
+### 5.2 不要在全局锁内做文件系统 I/O
+
+锁内只应做内存状态更新和轻量决策。扫描、`stat`、CSV 解析、目录遍历都应该在锁外完成，然后用快照合并回状态。
+
+### 5.3 “终态”必须包含所有真实终态，并用心跳兜底
+
+失败、停止、卡住、上传终止都属于终态。但“状态文件说失败了”不等于“没有子进程还在写 `.part`”。用一次很小的心跳读取作为廉价兜底，比每轮全树 `rglob` 更合理。
+
+### 5.4 隐藏成本往往比显式代码更贵
+
+本次审计发现的高成本操作包括：
+
+- 每次状态刷新通过 PowerShell 做 DPAPI 解密
+- 每 15 秒对整张 inventory 逐行 `stat`
+- 每 10 秒对整批数据 `sorted(rglob("*"))`
+- 每个下载文件新建一个 boto3 client
+- 并发打开 NetCDF/HDF5 做校验
+- 在高频调用的地方枚举 A:\–Z:\
+
+这些都不是“明显的死循环”，但在机械盘上会持续放大系统压力。
+
+### 5.5 应用侧证据和硬件侧证据要分开
+
+Windows 蓝屏需要同时看：
+
+- 应用是否制造了极端 I/O / 内存 / 线程压力
+- 是否存在内存、SSD/HDD、存储驱动、文件过滤驱动、Hyper-V/WSL 的问题
+
+不能因为代码有 I/O 问题就断定蓝屏一定是代码造成的；也不能因为蓝屏可能是硬件问题就忽略代码的放大作用。
+
+### 5.6 回归测试要断言“不要做什么”
+
+这次新增的测试不仅验证结果，还显式断言：
+
+- 空闲队列不得调用 `task_summaries()`
+- 终态轻量路径不得调用 `_task_summary()` 或 `has_recent_download_part()`
+
+这种“负向断言”比单纯测返回值更能防止性能问题回归。
+
+---
+
+## 6. 未改内容与后续建议
+
+以下内容本次**没有修改**，下一个对话应优先评估。
+
+### 6.1 上传器全树扫描与重复哈希（原审计 P0-5）
+
+文件：`src/geo_downloader/geo_ring_cloud_auto_uploader.py`
+
+- `watch_and_upload()` 每 10 秒调用 `discover_completed_files()`。
+- `iter_batch_files()` 内部使用 `sorted(platform_root.rglob("*"))`，会把整棵树路径一次性物化。
+- 连续上传前对每个文件做 `sha256_file()`。
+- `prepare_manifest()` 与上传器可能对同一批数据重复做 SHA-256。
+
+建议：
+
+- 改成增量索引，基于 manifest / `os.scandir` + mtime 缓存。
+- 全量 SHA-256 只做一次，写入 manifest 后复用。
+- 用锁避免 PS1 `prepare` 与连续上传器同时哈希。
+
+### 6.2 下载器资源使用（原审计 P0-6）
+
+文件：`src/geo_downloader/geo_cloud_downloader.py`
+
+- `run_download_s3_range()` 的 worker 每个文件调用 `get_s3_client()`，没有连接复用。
+- `run_inventory()` 一次性提交所有 job，所有结果累积在内存后写 CSV。
+- 16 路下载并发打开 NetCDF/HDF5 校验。
+- 每文件完成后写 `download_parallelism_status.json`，与大数据写入在同一块机械盘上交错。
+
+建议：
+
+- boto3 client 按线程复用。
+- inventory 分批落盘。
+- NetCDF/HDF5 校验限制为 1–2 路，或批次结束后统一校验。
+- 降低并发默认值（尤其机械盘）。
+
+### 6.3 PS1 输出缓冲
+
+文件：`src/geo_downloader/geo_ring_cloud_transfer_batch.ps1`
+
+- `Invoke-DownloadPython` 用 `$commandOutput = & ... 2>&1` 先缓存全部子进程输出，再写日志。
+- 长任务/大量 stderr 时可能占用较大内存。
+
+建议改为逐行流式写入日志。
+
+### 6.4 旧版监控脚本
+
+文件：`src/geo_downloader/monitor_dashboard.py`
+
+- 每次刷新启动 PowerShell 子进程。
+- 对 `DOWNLOAD_ROOT` 做 `rglob("*.part")`。
+- 前端 10 秒刷新。
+
+主仪表盘目前只 import 了它的几个函数，但如果单独运行该脚本，风险仍然很高。
+
+### 6.5 清理脚本硬编码路径
+
+文件：`scripts/cleanup_verified_data.ps1`
+
+- 硬编码 `F:\GEO_Cloud_2024_batches`。
+- 使用 `Remove-Item -Recurse -Force`。
+
+建议改为必填参数，并做根路径/驱动器校验，避免误删其他盘数据。
+
+### 6.6 旧计划任务与旧副本
+
+系统里仍存在指向旧副本的计划任务：
+
+```text
+D:\AAAresearch_paper\third_report\code\geo_cloud_download\...
+```
+
+建议：
+
+- 禁用所有不再使用的 `GeoRingCloud-*` 计划任务。
+- 确认本机只运行一套代码（当前仓库或旧副本，不要混跑）。
+
+### 6.7 硬件/驱动排查
+
+仍需并行进行：
+
+- Windows 内存诊断或 MemTest86
+- `F:` 机械盘 SMART、`chkdsk F: /scan`
+- 存储/芯片组驱动更新
+- Hyper-V / WSL / Docker / VBS 相关组件检查
+- 杀毒/文件过滤驱动对数据目录的实时扫描排除
+- 页面文件与崩溃转储配置检查
+
+---
+
+## 7. 新对话快速接手清单
+
+1. 查看提交：
+
+   ```powershell
+   git log --oneline -5
+   git show --stat 9a1f87e
+   ```
+
+2. 查看本次完整改动：
+
+   ```powershell
+   git show 9a1f87e -- src/geo_downloader/geo_ring_cloud_transfer_dashboard.py
+   git show 9a1f87e -- src/geo_downloader/geo_ring_cloud/batch_queue.py
+   git show 9a1f87e -- src/geo_downloader/tests/test_geo_ring_cloud_transfer_batch.py
+   ```
+
+3. 关键函数：
+
+   - `DashboardState._process_batch_queue_once_unlocked`
+   - `DashboardState.task_summaries`
+   - `DashboardState._task_summary_lite`
+   - `DashboardState._compute_waiting_queue_updates`
+   - `DashboardState.status_cached`
+   - `DashboardState.__init__` 中的缓存字段
+   - `read_inventory_by_remote_type`
+   - `BoundedThreadingHTTPServer`
+   - `batch_queue._collect_authoritative_inventory`
+
+4. 跑测试：
+
+   ```powershell
+   python -m pytest -q
+   ```
+
+5. 下一步优先级：
+
+   1. 上传器增量扫描 + 单次哈希（P0-5）
+   2. boto3 client 复用 + inventory 分批落盘（P0-6）
+   3. 禁用旧计划任务/旧副本
+   4. 硬件/驱动排查
+   5. 视情况降低默认下载/上传并发
+
+---
+
+## 8. 当前 Git 状态
+
+- 本次提交已 push：
+
+  ```text
+  a24831a..9a1f87e  main -> main
+  ```
+
+- 本地与 `origin/main` 同步。
+- 以下文件仍是未跟踪状态，未纳入本次提交：
+
+  ```text
+  AGENTS.md
+  SETUP.md
+  docs/system-flow.mmd
+  scripts/cleanup_verified_data.ps1
+  src/geo_downloader/tests/__init__.py
+  ```
+
+  这些文件在本次工作开始前就已存在，是否提交需要用户单独确认。
