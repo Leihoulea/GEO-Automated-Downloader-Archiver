@@ -11,10 +11,11 @@ import csv
 import hashlib
 import json
 import os
+import threading
 import time
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, MutableMapping
+from typing import Dict, Iterable, List, Mapping, MutableMapping, Tuple
 
 
 COMPONENT_ROLE = "batch_queue"
@@ -252,30 +253,46 @@ def estimate_required_space(
     }
 
 
-def refine_estimate_from_inventory(
-    estimate: Mapping[str, object], inventory_path: Path
-) -> Dict[str, object]:
-    """Replace empirical S3 estimates with authoritative pending bytes.
+_INVENTORY_AUTHORITATIVE_CACHE: Dict[
+    Tuple[str, int, int, Tuple[str, ...]], Dict[str, Dict[str, int]]
+] = {}
+_INVENTORY_AUTHORITATIVE_LOCK = threading.Lock()
+_INVENTORY_AUTHORITATIVE_CACHE_LIMIT = 32
 
-    S3 inventory sizes are object ``ContentLength`` values.  EUMETSAT catalogue
-    sizes are intentionally ignored because they describe catalogue records,
-    not the delivered ZIP payloads.
+
+def _collect_authoritative_inventory(
+    inventory_path: Path, platform_names: Iterable[str]
+) -> Dict[str, Dict[str, int]]:
+    """Return per-platform S3 byte totals, cached until the CSV changes.
+
+    The queue scheduler used to re-walk every inventory row (and ``stat`` every
+    local file) on every 15-second tick.  The inventory is immutable for a
+    waiting batch, so cache the expensive result keyed by file identity and
+    only recompute when the CSV's mtime/size changes.
     """
-    result = dict(estimate)
-    platform_estimates = {
-        str(name): dict(value)
-        for name, value in dict(estimate.get("platform_estimates", {})).items()
-        if isinstance(value, Mapping)
-    }
-    if not inventory_path.is_file() or not platform_estimates:
-        return result
+    platforms = tuple(sorted(str(name) for name in platform_names))
+    try:
+        stat = inventory_path.stat()
+    except OSError:
+        return {}
+    cache_key = (
+        str(inventory_path.resolve()),
+        stat.st_mtime_ns,
+        stat.st_size,
+        platforms,
+    )
+    with _INVENTORY_AUTHORITATIVE_LOCK:
+        cached = _INVENTORY_AUTHORITATIVE_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
 
+    selected = set(platforms)
     authoritative: Dict[str, Dict[str, int]] = {}
     try:
         with inventory_path.open("r", encoding="utf-8-sig", newline="") as handle:
             for row in csv.DictReader(handle):
                 platform = str(row.get("platform", ""))
-                if platform not in platform_estimates or row.get("remote_type") != "s3":
+                if platform not in selected or row.get("remote_type") != "s3":
                     continue
                 if row.get("status") != "found":
                     continue
@@ -298,8 +315,36 @@ def refine_estimate_from_inventory(
                 if not complete:
                     summary["pending_bytes"] += expected
     except (OSError, csv.Error):
+        return {}
+
+    with _INVENTORY_AUTHORITATIVE_LOCK:
+        if len(_INVENTORY_AUTHORITATIVE_CACHE) >= _INVENTORY_AUTHORITATIVE_CACHE_LIMIT:
+            _INVENTORY_AUTHORITATIVE_CACHE.clear()
+        _INVENTORY_AUTHORITATIVE_CACHE[cache_key] = authoritative
+    return authoritative
+
+
+def refine_estimate_from_inventory(
+    estimate: Mapping[str, object], inventory_path: Path
+) -> Dict[str, object]:
+    """Replace empirical S3 estimates with authoritative pending bytes.
+
+    S3 inventory sizes are object ``ContentLength`` values.  EUMETSAT catalogue
+    sizes are intentionally ignored because they describe catalogue records,
+    not the delivered ZIP payloads.
+    """
+    result = dict(estimate)
+    platform_estimates = {
+        str(name): dict(value)
+        for name, value in dict(estimate.get("platform_estimates", {})).items()
+        if isinstance(value, Mapping)
+    }
+    if not inventory_path.is_file() or not platform_estimates:
         return result
 
+    authoritative = _collect_authoritative_inventory(
+        inventory_path, platform_estimates.keys()
+    )
     if not authoritative:
         return result
     required_gib = float(result.get("required_gib", 0) or 0)

@@ -92,6 +92,18 @@ AUTO_UPLOADER_PATH = APP_ROOT / "geo_ring_cloud_auto_uploader.py"
 NOTIFICATION_SERVICE_PATH = APP_ROOT / "geo_ring_cloud_notification_service.py"
 BATCH_SCRIPT_PATH = APP_ROOT / "geo_ring_cloud_transfer_batch.ps1"
 AUTO_UPLOAD_STALE_SECONDS = 15 * 60
+# Serve a short-lived status snapshot so multiple browser tabs (and the
+# notification/queue schedulers) cannot each trigger a full disk scan.
+STATUS_CACHE_TTL_SECONDS = 8.0
+# Pending-space estimates only change when the inventory file or local data
+# changes; refreshing them every 15 seconds used to stat every inventory row.
+ESTIMATE_REFRESH_SECONDS = 300.0
+# Settings and email status require DPAPI decryption via hidden PowerShell.
+# Cache them so dashboard refreshes do not spawn several processes each time.
+RUNTIME_INFO_CACHE_TTL_SECONDS = 60.0
+# Hard cap on concurrent HTTP handler threads.  Without it, a slow disk (or
+# many browser tabs) can create an unbounded number of waiting threads.
+MAX_HTTP_WORKERS = 8
 DOWNLOAD_PLATFORM_NAMES = (
     "GOES-16",
     "GOES-18",
@@ -290,6 +302,67 @@ def read_inventory(path: Path, remote_type: str = "") -> Dict[str, object]:
     return result
 
 
+def read_inventory_by_remote_type(
+    path: Path, remote_types: Iterable[str]
+) -> Dict[str, Dict[str, object]]:
+    """Aggregate one combined inventory CSV in a single pass.
+
+    The dashboard used to call ``read_inventory`` once per source, which streamed
+    the same large CSV three times per refresh.  This keeps the exact per-source
+    result shape while touching the file only once.
+    """
+    results: Dict[str, Dict[str, object]] = {
+        str(remote_type): {
+            "path": str(path),
+            "exists": path.is_file(),
+            "rows": 0,
+            "found": 0,
+            "missing": 0,
+            "error": 0,
+            "estimated_size_bytes": 0,
+            "by_platform": {},
+            "by_product": {},
+        }
+        for remote_type in remote_types
+    }
+    if not path.is_file() or not results:
+        return results
+    by_platform = {remote_type: Counter() for remote_type in results}
+    by_product = {remote_type: Counter() for remote_type in results}
+    try:
+        with path.open("r", newline="", encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                remote_type = row.get("remote_type", "")
+                result = results.get(remote_type)
+                if result is None:
+                    continue
+                result["rows"] = int(result["rows"]) + 1
+                status = row.get("status", "")
+                if status in {"found", "missing", "error"}:
+                    result[status] = int(result[status]) + 1
+                if status == "found":
+                    platform = row.get("platform", "")
+                    product = row.get("product", "")
+                    by_platform[remote_type][platform] += 1
+                    by_product[remote_type]["{} {}".format(platform, product)] += 1
+                    size = row.get("size_bytes", "")
+                    if str(size).isdigit():
+                        result["estimated_size_bytes"] = int(
+                            result["estimated_size_bytes"]
+                        ) + int(size)
+    except Exception as exc:
+        for result in results.values():
+            result["read_error"] = "{}: {}".format(type(exc).__name__, exc)
+    for remote_type, result in results.items():
+        result["estimated_size_label"] = format_bytes(
+            int(result["estimated_size_bytes"])
+        )
+        result["by_platform"] = dict(by_platform[remote_type])
+        result["by_product"] = dict(by_product[remote_type])
+        result["updated_at"] = iso_mtime(path)
+    return results
+
+
 def read_downloaded_manifest(path: Path, remote_type: str = "") -> Dict[str, object]:
     """Count durable completed rows instead of only the latest log session."""
     result: Dict[str, object] = {
@@ -345,8 +418,10 @@ def summarize_download(
     manifest_path: Path,
     pattern,
     start_token: str,
+    sizes: Optional[Dict[Tuple[str, str, str], int]] = None,
 ) -> Dict[str, object]:
-    sizes = read_manifest_sizes(manifest_path)
+    if sizes is None:
+        sizes = read_manifest_sizes(manifest_path)
     events = parse_download_log(log_path, pattern, after_last_start=True)
     start = parse_start(log_path, start_token)
     completed_events = [event for event in events if event["status"] == "downloaded"]
@@ -1103,6 +1178,55 @@ class DashboardState:
         self._notification_process: Optional[subprocess.Popen] = None
         self._download_process: Optional[subprocess.Popen] = None
         self._download_process_lock = threading.Lock()
+        self._status_cache: Dict[str, Tuple[float, Dict[str, object]]] = {}
+        self._status_cache_lock = threading.Lock()
+        self._public_settings_cache: Optional[Tuple[float, Dict[str, object]]] = None
+        self._notification_status_cache: Optional[
+            Tuple[float, Dict[str, object]]
+        ] = None
+
+    def invalidate_runtime_info_cache(self) -> None:
+        self._public_settings_cache = None
+        self._notification_status_cache = None
+
+    def _public_settings_cached(self) -> Dict[str, object]:
+        cached = self._public_settings_cache
+        now = time.monotonic()
+        if cached is not None and now - cached[0] < RUNTIME_INFO_CACHE_TTL_SECONDS:
+            return cached[1]
+        result = self.get_settings()
+        self._public_settings_cache = (now, result)
+        return result
+
+    def _notification_status_cached(self) -> Dict[str, object]:
+        cached = self._notification_status_cache
+        now = time.monotonic()
+        if cached is not None and now - cached[0] < RUNTIME_INFO_CACHE_TTL_SECONDS:
+            return dict(cached[1])
+        result = self.email_notifier.public_status()
+        self._notification_status_cache = (now, result)
+        return dict(result)
+
+    def invalidate_status_cache(self) -> None:
+        with self._status_cache_lock:
+            self._status_cache.clear()
+
+    def status_cached(self, batch_name: str = "") -> Dict[str, object]:
+        """Return a short-lived snapshot, computing it only once per TTL.
+
+        The HTTP server is threaded, so without this a slow disk makes every
+        refresh spawn another full scan.  Holding the lock during the first
+        computation also coalesces concurrent tabs into a single scan.
+        """
+        key = str(batch_name or "")
+        with self._status_cache_lock:
+            cached = self._status_cache.get(key)
+            now = time.monotonic()
+            if cached is not None and now - cached[0] < STATUS_CACHE_TTL_SECONDS:
+                return cached[1]
+            result = self.status(batch_name)
+            self._status_cache[key] = (time.monotonic(), result)
+            return result
 
     def update_settings(self, request: Dict[str, object]) -> Dict[str, object]:
         """Persist dashboard settings from a web form, then apply to runtime."""
@@ -1149,6 +1273,8 @@ class DashboardState:
             }
         apply_to_environment()
         self.email_notifier.reload_settings()
+        self.invalidate_runtime_info_cache()
+        self.invalidate_status_cache()
         return public_settings()
 
     def get_settings(self) -> Dict[str, object]:
@@ -1502,11 +1628,20 @@ class DashboardState:
         """Lightweight summary without rglob or heartbeat checks. For completed batches."""
         xftp = marker_status(batch_root / "transfer" / "xftp_upload_complete.json")
         server = server_verification_status(batch_root / "transfer")
-        download_status = str(raw.get("status", launcher_raw.get("status", "UNKNOWN"))).upper()
-        if download_status == "COMPLETE" or raw.get("status") == "complete":
+        raw_status = str(raw.get("status", "")).lower()
+        launcher_status = str(launcher_raw.get("status", "")).upper()
+        if raw_status == "complete" or launcher_status in {
+            "COMPLETE",
+            "COMPLETED",
+            "PASS",
+        }:
             download_status = "COMPLETE"
-        elif download_status in {"FAIL", "FAILED"} or raw.get("status") == "failed":
+        elif raw_status == "failed" or launcher_status in {"FAIL", "FAILED"}:
             download_status = "FAIL"
+        elif raw_status == "stopped" or launcher_status == "STOPPED":
+            download_status = "STOPPED"
+        else:
+            download_status = launcher_status or raw_status.upper() or "UNKNOWN"
         upload_status = str(upload_raw.get("status", "PENDING"))
         if xftp.get("payload", {}).get("status") == "AUTOMATED_SFTP_COMPLETE":
             upload_status = "PASS"
@@ -1516,6 +1651,12 @@ class DashboardState:
             str(upload_raw.get("updated_at", "")),
             str(server.get("verified_at", "")),
         ]
+        error = str(
+            upload_raw.get("error", "")
+            or raw.get("message", "")
+            or launcher_raw.get("message", "")
+            or ""
+        )
         return {
             "batch_name": batch_root.name,
             "batch_root": str(batch_root),
@@ -1532,8 +1673,8 @@ class DashboardState:
             "upload_percent": float(upload_raw.get("percent", 0) or 0),
             "server_status": str(server.get("status", "PENDING")),
             "transfer_status": str(transfer_manifest_status(batch_root / "transfer").get("status", "PENDING")),
-            "error": "",
-            "disk_gate": {"exists": False, "message": ""},
+            "error": error,
+            "disk_gate": parse_disk_gate(error),
             "updated_at": max(updated_candidates),
             "automatic_delete": False,
         }
@@ -1589,6 +1730,18 @@ class DashboardState:
         }
 
     def task_summaries(self, limit: Optional[int] = 30) -> List[Dict[str, object]]:
+        terminal_upload = {"PASS", "FAIL", "FAILED", "STOPPED", "STALLED"}
+        terminal_launcher = {
+            "FAIL",
+            "FAILED",
+            "COMPLETE",
+            "COMPLETED",
+            "PASS",
+            "EXITED",
+            "CANCELLED",
+            "CANCELED",
+            "STOPPED",
+        }
         tasks = []
         for parent in self._known_batch_parents():
             try:
@@ -1599,24 +1752,37 @@ class DashboardState:
                 transfer_dir = batch_root / "transfer"
                 if not transfer_dir.is_dir():
                     continue
-                # Skip batches that are clearly done to avoid rglob on large dirs
                 raw = read_json(transfer_dir / "batch_status.json")
                 upload = read_json(transfer_dir / "auto_upload_status.json")
                 launcher = read_json(transfer_dir / "download_launcher_status.json")
-                is_done = (
-                    str(upload.get("status", "")).upper() in {"PASS", "FAIL", "FAILED"}
-                    or str(raw.get("status", "")) == "complete"
+                upload_status = str(upload.get("status", "")).upper()
+                launcher_status = str(launcher.get("status", "")).upper()
+                raw_status = str(raw.get("status", "")).lower()
+                is_terminal = (
+                    upload_status in terminal_upload
+                    or raw_status in {"complete", "failed"}
+                    or launcher_status in terminal_launcher
                 )
-                if is_done:
-                    # Lightweight summary without rglob
-                    tasks.append(self._task_summary_lite(batch_root, raw, launcher, upload))
-                    continue
+                if is_terminal:
+                    # A failed/stopped batch can still have a detached child
+                    # writing .part files.  A fresh heartbeat is cheap to read
+                    # and avoids the expensive rglob when nothing is active.
+                    heartbeat = read_heartbeat(transfer_dir / DOWNLOAD_HEARTBEAT_NAME)
+                    if not heartbeat["alive"]:
+                        tasks.append(
+                            self._task_summary_lite(batch_root, raw, launcher, upload)
+                        )
+                        continue
                 tasks.append(self._task_summary(batch_root))
         tasks.sort(key=lambda row: str(row.get("updated_at", "")), reverse=True)
         return tasks[:limit] if limit else tasks
 
-    def _active_download_task(self, exclude_batch_name: str = "") -> Optional[Dict[str, object]]:
-        for task in self.task_summaries(limit=None):
+    def _active_download_task(
+        self,
+        exclude_batch_name: str = "",
+        tasks: Optional[List[Dict[str, object]]] = None,
+    ) -> Optional[Dict[str, object]]:
+        for task in (tasks if tasks is not None else self.task_summaries(limit=None)):
             if exclude_batch_name and task.get("batch_name") == exclude_batch_name:
                 continue
             if str(task.get("download_status", "")) in {"STARTING", "RUNNING"}:
@@ -1662,8 +1828,12 @@ class DashboardState:
                 )
         return estimate
 
-    def _refresh_pending_queue_estimates(self, state: Dict[str, object]) -> None:
-        """Refresh waiting items so persisted v1 estimates cannot become stale."""
+    def _compute_waiting_queue_updates(
+        self, state: Dict[str, object]
+    ) -> Dict[str, Dict[str, object]]:
+        """Compute expensive estimates/gates without holding the queue lock."""
+        updates: Dict[str, Dict[str, object]] = {}
+        now = time.time()
         for item in state.get("items", []):
             if not isinstance(item, dict) or item.get("status") not in {
                 "QUEUED",
@@ -1674,8 +1844,26 @@ class DashboardState:
             request = item.get("request")
             if not isinstance(request, dict):
                 continue
-            item["estimate"] = self._queue_estimate(request)
-            item["updated_at"] = utc_now_text()
+            estimate = (
+                item.get("estimate") if isinstance(item.get("estimate"), dict) else {}
+            )
+            last_refresh = float(item.get("estimate_refreshed_epoch", 0) or 0)
+            estimate_refreshed = False
+            if (
+                not estimate
+                or not last_refresh
+                or now - last_refresh >= ESTIMATE_REFRESH_SECONDS
+            ):
+                estimate = self._queue_estimate(request)
+                last_refresh = now
+                estimate_refreshed = True
+            updates[str(item.get("queue_id", ""))] = {
+                "estimate": estimate,
+                "gate": self._queue_gate(request, estimate),
+                "estimate_refreshed_epoch": last_refresh,
+                "estimate_refreshed": estimate_refreshed,
+            }
+        return updates
 
     def enqueue_download(self, request: Dict[str, object]) -> Dict[str, object]:
         try:
@@ -1760,8 +1948,16 @@ class DashboardState:
             "checked_at": utc_now_text(),
         }
 
-    def _sync_launched_queue_items(self, state: Dict[str, object]) -> None:
-        tasks = {task["batch_name"]: task for task in self.task_summaries(limit=None)}
+    def _sync_launched_queue_items(
+        self,
+        state: Dict[str, object],
+        tasks_by_name: Optional[Dict[str, Dict[str, object]]] = None,
+    ) -> None:
+        if tasks_by_name is None:
+            tasks_by_name = {
+                task["batch_name"]: task for task in self.task_summaries(limit=None)
+            }
+        tasks = tasks_by_name
         for item in state["items"]:
             if not isinstance(item, dict) or item.get("status") not in {"STARTING", "RUNNING"}:
                 continue
@@ -1823,11 +2019,34 @@ class DashboardState:
         self._queue_last_check_at = utc_now_text()
         self._queue_last_error = ""
         launch_item: Optional[Dict[str, object]] = None
+
+        # Idle scheduler ticks must not scan every batch.  Only a queue item
+        # that is waiting or being launched requires batch state at all.
+        with self._queue_lock:
+            snapshot = read_queue_state(self.queue_state_path)
+        queue_statuses = {
+            str(item.get("status", ""))
+            for item in snapshot.get("items", [])
+            if isinstance(item, dict)
+        }
+        if not queue_statuses.intersection(ACTIVE_QUEUE_STATUSES):
+            return self.batch_queue_status()
+
+        # Heavy batch scanning happens outside the queue lock so /api/status
+        # and batch_queue_status() never wait on a full directory walk.
+        tasks = self.task_summaries(limit=None)
+        tasks_by_name = {
+            str(task.get("batch_name", "")): task for task in tasks
+        }
+        active = self._active_download_task(tasks=tasks)
+
+        # Expensive estimate/gate computation also stays outside the lock.
+        prepared = self._compute_waiting_queue_updates(snapshot)
+
+        # Only cheap state mutation and the launch decision run under the lock.
         with self._queue_lock:
             state = read_queue_state(self.queue_state_path)
-            self._sync_launched_queue_items(state)
-            self._refresh_pending_queue_estimates(state)
-            active = self._active_download_task()
+            self._sync_launched_queue_items(state, tasks_by_name)
             for item in state["items"]:
                 if not isinstance(item, dict) or item.get("status") not in {
                     "QUEUED",
@@ -1835,9 +2054,18 @@ class DashboardState:
                     "WAITING_SPACE",
                 }:
                     continue
-                gate = self._queue_gate(item["request"], item["estimate"])
-                item["gate"] = gate
+                update = prepared.get(str(item.get("queue_id", "")))
+                if update is None:
+                    # Item was added after the snapshot; handle it next tick.
+                    continue
+                item["estimate"] = update["estimate"]
+                item["gate"] = update["gate"]
+                if update["estimate_refreshed"]:
+                    item["estimate_refreshed_epoch"] = update[
+                        "estimate_refreshed_epoch"
+                    ]
                 item["updated_at"] = utc_now_text()
+                gate = update["gate"]
                 if active:
                     item["status"] = "WAITING_ACTIVE_DOWNLOAD"
                     item["status_message"] = "等待当前下载批次 {} 完成。".format(
@@ -1974,6 +2202,8 @@ class DashboardState:
         password = ""
         self.email_notifier.reload_settings()
         test = self.email_notifier.send_test()
+        self.invalidate_runtime_info_cache()
+        self.invalidate_status_cache()
         return {
             "status": "PASS",
             "recipient": test["recipient"],
@@ -2023,30 +2253,50 @@ class DashboardState:
         transfer_dir = batch_root / "transfer"
         combined_inventory_path = manifest_dir / "manifest_inventory.csv"
         legacy_met_inventory_path = manifest_dir / "manifest_meteosat_inventory.csv"
-        met_inventory_path = (
-            combined_inventory_path if combined_inventory_path.is_file() else legacy_met_inventory_path
-        )
-        s3_inventory_path = combined_inventory_path
-        s3_inventory = read_inventory(s3_inventory_path, "s3")
-        met_inventory = read_inventory(met_inventory_path, "eumetsat")
-        epic_inventory = read_inventory(combined_inventory_path, "earthdata")
+        if combined_inventory_path.is_file():
+            inventories = read_inventory_by_remote_type(
+                combined_inventory_path, ("s3", "eumetsat", "earthdata")
+            )
+            s3_inventory = inventories["s3"]
+            met_inventory = inventories["eumetsat"]
+            epic_inventory = inventories["earthdata"]
+            s3_inventory_path = combined_inventory_path
+            met_inventory_path = combined_inventory_path
+        else:
+            s3_inventory_path = combined_inventory_path
+            met_inventory_path = legacy_met_inventory_path
+            s3_inventory = read_inventory(s3_inventory_path, "s3")
+            met_inventory = read_inventory(met_inventory_path, "eumetsat")
+            epic_inventory = read_inventory(combined_inventory_path, "earthdata")
+
+        size_cache: Dict[str, Dict[Tuple[str, str, str], int]] = {}
+
+        def sizes_for(path: Path) -> Dict[Tuple[str, str, str], int]:
+            key = str(path)
+            if key not in size_cache:
+                size_cache[key] = read_manifest_sizes(path)
+            return size_cache[key]
+
         s3_download = summarize_download(
             log_dir / "download_s3_range.log",
             s3_inventory_path,
             S3_EVENT_RE,
             "download_s3_range_start",
+            sizes=sizes_for(s3_inventory_path),
         )
         met_download = summarize_download(
             log_dir / "download_meteosat_range.log",
             met_inventory_path,
             MET_DOWNLOAD_RE,
             "download_meteosat_range_start",
+            sizes=sizes_for(met_inventory_path),
         )
         epic_download = summarize_download(
             log_dir / "download_epic_range.log",
             combined_inventory_path,
             EPIC_DOWNLOAD_RE,
             "download_epic_range_start",
+            sizes=sizes_for(combined_inventory_path),
         )
         s3_completed_manifest = read_downloaded_manifest(
             manifest_dir / "manifest_downloaded.csv", "s3"
@@ -2250,7 +2500,7 @@ class DashboardState:
             ),
         )
         tasks = self.task_summaries()
-        notification_status = self.email_notifier.public_status()
+        notification_status = self._notification_status_cached()
         notification_monitor = dict(notification_status.get("monitor", {}))
         notification_monitor["process_alive"] = process_is_running(
             notification_monitor.get("pid")
@@ -2343,7 +2593,7 @@ class DashboardState:
                 "automatic_delete": False,
                 "cleanup_button_deletes_data": False,
             },
-            "settings": self.get_settings(),
+            "settings": self._public_settings_cached(),
         }
 
     def start_download(self, request: Dict[str, object]) -> Dict[str, object]:
@@ -3210,7 +3460,7 @@ def make_handler(state: DashboardState):
             if path == "/api/status":
                 batch_name = parse_qs(parsed.query).get("batch_name", [""])[0]
                 try:
-                    self.send_json(state.status(batch_name))
+                    self.send_json(state.status_cached(batch_name))
                 except RuntimeError as exc:
                     self.send_json({"ok": False, "error": str(exc)}, 404)
                 return
@@ -3239,6 +3489,8 @@ def make_handler(state: DashboardState):
 
         def do_POST(self) -> None:
             path = urlparse(self.path).path
+            # A mutating request must not be followed by a stale cached page.
+            state.invalidate_status_cache()
             try:
                 if path == "/api/actions/start-download":
                     payload = self.read_json_body(required=True)
@@ -3405,6 +3657,10 @@ def make_handler(state: DashboardState):
                 self.send_json({"ok": False, "error": str(exc)}, 409)
             except Exception as exc:
                 self.send_json({"ok": False, "error": "{}: {}".format(type(exc).__name__, exc)}, 500)
+            finally:
+                # Ensure the next GET observes the action's effects even if a
+                # concurrent request repopulated the cache during this POST.
+                state.invalidate_status_cache()
 
         def log_message(self, fmt: str, *args) -> None:
             return
@@ -3456,6 +3712,33 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+class BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer with a hard cap on concurrent handler threads."""
+
+    def __init__(
+        self,
+        server_address,
+        request_handler_class,
+        max_workers: int = MAX_HTTP_WORKERS,
+    ):
+        self._request_slots = threading.BoundedSemaphore(max(1, int(max_workers)))
+        super().__init__(server_address, request_handler_class)
+
+    def process_request(self, request, client_address) -> None:
+        self._request_slots.acquire()
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._request_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._request_slots.release()
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
     apply_to_environment()
@@ -3481,7 +3764,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     state.start_notification_monitor()
     state.start_batch_queue_scheduler()
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(state))
+    server = BoundedThreadingHTTPServer(
+        (args.host, args.port), make_handler(state), max_workers=MAX_HTTP_WORKERS
+    )
     print("http://{}:{}".format(args.host, args.port), flush=True)
     server.serve_forever()
     return 0

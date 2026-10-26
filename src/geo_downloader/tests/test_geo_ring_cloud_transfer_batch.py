@@ -1506,6 +1506,221 @@ class TransferBatchTests(unittest.TestCase):
             self.assertEqual(payload["file_count"], 1)
             self.assertTrue(control_partial.is_file())
 
+    def test_read_inventory_by_remote_type_uses_one_pass_and_keeps_split_counts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "manifest_inventory.csv"
+            path.write_text(
+                "remote_type,platform,product,status,size_bytes\n"
+                "s3,GOES-16,ACMF,found,100\n"
+                "s3,GOES-18,CTPF,found,200\n"
+                "s3,GOES-16,ACMF,missing,0\n"
+                "eumetsat,Meteosat-0deg,CLM,found,300\n"
+                "earthdata,DSCOVR-EPIC,EPIC-L2-CLOUD,found,400\n",
+                encoding="utf-8",
+            )
+            result = transfer_dashboard.read_inventory_by_remote_type(
+                path, ("s3", "eumetsat", "earthdata")
+            )
+
+        self.assertEqual(result["s3"]["rows"], 3)
+        self.assertEqual(result["s3"]["found"], 2)
+        self.assertEqual(result["s3"]["missing"], 1)
+        self.assertEqual(result["s3"]["estimated_size_bytes"], 300)
+        self.assertEqual(result["s3"]["by_platform"], {"GOES-16": 1, "GOES-18": 1})
+        self.assertEqual(result["eumetsat"]["found"], 1)
+        self.assertEqual(result["earthdata"]["found"], 1)
+
+    def test_terminal_failed_batch_uses_lite_summary_without_tree_walk(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            batch = Path(temp_dir) / "batch"
+            transfer = batch / "transfer"
+            transfer.mkdir(parents=True)
+            (batch / "GOES-16" / "ACMF" / "20240401" / "00").mkdir(parents=True)
+            error = (
+                "Not enough free space: {'drive': 'F:', 'free_gib': 1.0, "
+                "'needed_gib_with_margin': 2.0}"
+            )
+            (transfer / "batch_status.json").write_text(
+                json.dumps({"status": "failed", "phase": "failed", "message": error}),
+                encoding="utf-8",
+            )
+            (transfer / "download_launcher_status.json").write_text(
+                json.dumps({"status": "FAIL", "exit_code": 1, "message": error}),
+                encoding="utf-8",
+            )
+            dashboard = DashboardState(batch)
+            with patch.object(
+                DashboardState,
+                "_task_summary",
+                side_effect=AssertionError("full scan must not run"),
+            ), patch.object(
+                transfer_dashboard,
+                "has_recent_download_part",
+                side_effect=AssertionError("rglob must not run"),
+            ):
+                tasks = dashboard.task_summaries()
+
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(tasks[0]["download_status"], "FAIL")
+        self.assertEqual(tasks[0]["error"], error)
+        self.assertTrue(tasks[0]["disk_gate"]["exists"])
+
+    def test_terminal_failed_batch_with_live_heartbeat_uses_full_summary(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            batch = Path(temp_dir) / "batch"
+            transfer = batch / "transfer"
+            transfer.mkdir(parents=True)
+            (transfer / "batch_status.json").write_text(
+                json.dumps({"status": "failed"}), encoding="utf-8"
+            )
+            write_heartbeat(
+                transfer / DOWNLOAD_HEARTBEAT_NAME, pid=123, phase="downloading"
+            )
+            sentinel = {"batch_name": batch.name, "download_status": "RUNNING"}
+            dashboard = DashboardState(batch)
+            with patch.object(
+                DashboardState, "_task_summary", return_value=sentinel
+            ) as full, patch.object(
+                DashboardState,
+                "_task_summary_lite",
+                side_effect=AssertionError("lite must not run"),
+            ):
+                tasks = dashboard.task_summaries()
+
+        full.assert_called_once()
+        self.assertEqual(tasks, [sentinel])
+
+    def test_status_cache_reuses_snapshot_until_invalidated(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "batch"
+            root.mkdir()
+            dashboard = DashboardState(root)
+            with patch.object(dashboard, "status", wraps=dashboard.status) as spy:
+                first = dashboard.status_cached()
+                second = dashboard.status_cached()
+                self.assertIs(first, second)
+                self.assertEqual(spy.call_count, 1)
+
+                dashboard.invalidate_status_cache()
+                dashboard.status_cached()
+                self.assertEqual(spy.call_count, 2)
+
+    def test_waiting_queue_estimate_refresh_is_throttled_across_ticks(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "current_batch"
+            root.mkdir()
+            dashboard = DashboardState(root)
+            fake_usage = SimpleNamespace(
+                total=10 * (1024 ** 4), used=0, free=10 * (1024 ** 4)
+            )
+            with patch(
+                "geo_ring_cloud_transfer_dashboard.shutil.disk_usage",
+                return_value=fake_usage,
+            ), patch.object(
+                dashboard,
+                "_active_download_task",
+                return_value={"batch_name": "active"},
+            ), patch.object(
+                dashboard, "_queue_estimate", wraps=dashboard._queue_estimate
+            ) as estimate_spy:
+                item = dashboard.enqueue_download(
+                    {
+                        "start_date": "2024-05-01",
+                        "end_date": "2024-05-02",
+                        "platforms": ["GOES-18"],
+                        "continuous_upload": False,
+                    }
+                )
+                calls_after_enqueue = estimate_spy.call_count
+                dashboard.process_batch_queue_once()
+
+        self.assertEqual(item["status"], "WAITING_ACTIVE_DOWNLOAD")
+        self.assertEqual(estimate_spy.call_count, calls_after_enqueue)
+
+    def test_idle_queue_does_not_scan_batches(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "current_batch"
+            root.mkdir()
+            dashboard = DashboardState(root)
+            with patch.object(
+                dashboard,
+                "task_summaries",
+                side_effect=AssertionError("idle queue must not scan batches"),
+            ):
+                result = dashboard.process_batch_queue_once()
+
+        self.assertEqual(result["active_count"], 0)
+
+    def test_terminal_lite_summary_uses_launcher_stopped_over_stale_status(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            batch = Path(temp_dir) / "batch"
+            transfer = batch / "transfer"
+            transfer.mkdir(parents=True)
+            (transfer / "batch_status.json").write_text(
+                json.dumps({"status": "running", "phase": "s3_download"}),
+                encoding="utf-8",
+            )
+            (transfer / "download_launcher_status.json").write_text(
+                json.dumps({"status": "STOPPED", "finished_at": "2026-08-12T00:00:00Z"}),
+                encoding="utf-8",
+            )
+            dashboard = DashboardState(batch)
+            with patch.object(
+                DashboardState,
+                "_task_summary",
+                side_effect=AssertionError("full scan must not run"),
+            ), patch.object(
+                transfer_dashboard,
+                "has_recent_download_part",
+                side_effect=AssertionError("rglob must not run"),
+            ):
+                tasks = dashboard.task_summaries()
+
+        self.assertEqual(tasks[0]["download_status"], "STOPPED")
+
+    def test_http_server_caps_concurrent_handler_threads(self):
+        with patch.object(
+            transfer_dashboard.ThreadingHTTPServer, "__init__", return_value=None
+        ):
+            server = transfer_dashboard.BoundedThreadingHTTPServer(
+                ("127.0.0.1", 0), object, max_workers=2
+            )
+        slots = server._request_slots
+        self.assertTrue(slots.acquire(blocking=False))
+        self.assertTrue(slots.acquire(blocking=False))
+        self.assertFalse(slots.acquire(blocking=False))
+        slots.release()
+        slots.release()
+
+    def test_s3_inventory_refinement_is_cached_until_inventory_changes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            pending = root / "pending.nc"
+            inventory = root / "manifest_inventory.csv"
+            inventory.write_text(
+                "platform,remote_type,status,size_bytes,local_path\n"
+                f"GOES-16,s3,found,1073741824,{pending}\n",
+                encoding="utf-8",
+            )
+            request = normalize_request(
+                {
+                    "start_date": "2024-06-01",
+                    "end_date": "2024-06-01",
+                    "platforms": ["GOES-16"],
+                },
+                ["GOES-16"],
+            )
+            base = estimate_required_space(request)
+            first = refine_estimate_from_inventory(base, inventory)
+            second = refine_estimate_from_inventory(base, inventory)
+            self.assertEqual(second["required_bytes"], first["required_bytes"])
+            self.assertEqual(second["basis"], "trusted_inventory_pending_bytes_v2")
+
+            pending.write_bytes(b"x")
+            third = refine_estimate_from_inventory(base, inventory)
+
+        self.assertEqual(third["required_bytes"], first["required_bytes"])
+
 
 if __name__ == "__main__":
     unittest.main()
