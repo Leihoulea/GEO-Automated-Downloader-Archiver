@@ -150,6 +150,7 @@ function Write-BatchStatus {
         download_min_workers = $DownloadMinWorkers
         download_initial_workers = $DownloadInitialWorkers
         s3_range_mib = $S3RangeMiB
+        excluded_products = $ExcludedProducts
         network_mode = "direct_only"
         automatic_delete = $false
     }

@@ -30,13 +30,19 @@ from geo_ring_cloud_transfer_dashboard import (  # noqa: E402
     write_json_atomic as dashboard_write_json_atomic,
 )
 from geo_ring_cloud_auto_uploader import (  # noqa: E402
+    PendingUpload,
     build_auto_upload_manifest,
     discover_completed_files,
+    expected_inventory_entries,
+    group_pending_files,
+    parse_excluded_products,
     progressive_upload_worker_counts,
+    scan_pending_files,
     sftp_quote,
     subprocess_creation_flags,
     subprocess_startupinfo,
     validate_server_root,
+    watch_and_upload,
     write_json_atomic as uploader_write_json_atomic,
 )
 from geo_ring_cloud.batch_queue import (  # noqa: E402
@@ -1822,6 +1828,155 @@ class TransferBatchTests(unittest.TestCase):
             third = refine_estimate_from_inventory(base, inventory)
 
         self.assertEqual(third["required_bytes"], first["required_bytes"])
+
+    def test_parse_excluded_products_supports_platform_pairs(self):
+        parsed = parse_excluded_products("GOES-16:ACHAF,CTPF;Meteosat-0deg:CTH")
+        self.assertEqual(parsed["GOES-16"], {"ACHAF", "CTPF"})
+        self.assertEqual(parsed["Meteosat-0deg"], {"CTH"})
+        self.assertEqual(parse_excluded_products(""), {})
+
+    def test_expected_inventory_entries_filters_and_uses_s3_size(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            batch = Path(temp_dir) / "batch"
+            manifests = batch / "manifests"
+            manifests.mkdir(parents=True)
+            inventory = manifests / "manifest_inventory.csv"
+            inventory.write_text(
+                "target_time_utc,platform,product,remote_type,size_bytes,status,local_path\n"
+                "2024-04-01T00:00:00Z,GOES-16,ACMF,s3,100,found,{a}\n"
+                "2024-04-01T00:00:00Z,GOES-16,ACHAF,s3,200,found,{b}\n"
+                "2024-04-01T00:00:00Z,Meteosat-0deg,CLM,eumetsat,565,found,{c}\n"
+                "2024-04-01T00:00:00Z,GOES-16,CTPF,s3,300,missing,{d}\n"
+                "2024-04-02T00:00:00Z,GOES-16,CODF,s3,400,found,{e}\n"
+                "2024-04-01T00:00:00Z,GOES-18,CPSF,s3,500,found,{f}\n".format(
+                    a=batch / "GOES-16" / "ACMF" / "20240401" / "00" / "a.nc",
+                    b=batch / "GOES-16" / "ACHAF" / "20240401" / "00" / "b.nc",
+                    c=batch
+                    / "Meteosat-0deg"
+                    / "CLM"
+                    / "20240401"
+                    / "00"
+                    / "c.zip",
+                    d=batch / "GOES-16" / "CTPF" / "20240401" / "00" / "d.nc",
+                    e=batch / "GOES-16" / "CODF" / "20240402" / "00" / "e.nc",
+                    f=batch / "GOES-18" / "CPSF" / "20240401" / "00" / "f.nc",
+                ),
+                encoding="utf-8",
+            )
+            entries = expected_inventory_entries(
+                batch,
+                "2024-04-01",
+                "2024-04-01",
+                ["GOES-16", "Meteosat-0deg"],
+                "GOES-16:ACHAF",
+            )
+
+        self.assertEqual(len(entries), 2)
+        s3_entry = next(
+            entry for entry in entries.values() if entry.platform == "GOES-16"
+        )
+        met_entry = entries[
+            str(batch / "Meteosat-0deg" / "CLM" / "20240401" / "00" / "c.zip")
+        ]
+        self.assertEqual(s3_entry.expected_size, 100)
+        self.assertEqual(s3_entry.relative.as_posix(), "ACMF/20240401/00/a.nc")
+        self.assertIsNone(met_entry.expected_size)
+
+    def test_scan_pending_files_uses_size_and_two_poll_stability(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            known = root / "GOES-16" / "ACMF" / "a.nc"
+            unknown = root / "Meteosat-0deg" / "CLM" / "b.zip"
+            known.parent.mkdir(parents=True)
+            unknown.parent.mkdir(parents=True)
+            known.write_bytes(b"12345")
+            unknown.write_bytes(b"payload")
+            entries = {
+                str(known): PendingUpload(
+                    "GOES-16", known, Path("ACMF/a.nc"), len(b"12345")
+                ),
+                str(unknown): PendingUpload(
+                    "Meteosat-0deg", unknown, Path("CLM/b.zip"), None
+                ),
+            }
+            groups = group_pending_files(entries)
+            directory_mtimes = {}
+            stable = {}
+
+            first = scan_pending_files(entries, groups, directory_mtimes, stable)
+            self.assertEqual(first, [str(known)])
+
+            entries.pop(str(known), None)
+            groups = group_pending_files(entries)
+            second = scan_pending_files(entries, groups, directory_mtimes, stable)
+            self.assertEqual(second, [])
+
+            third = scan_pending_files(
+                entries, groups, directory_mtimes, stable, force=True
+            )
+            self.assertEqual(third, [str(unknown)])
+
+    def test_watch_and_upload_uses_inventory_index_instead_of_rglob(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            batch = Path(temp_dir) / "batch"
+            transfer = batch / "transfer"
+            manifests = batch / "manifests"
+            transfer.mkdir(parents=True)
+            manifests.mkdir(parents=True)
+            source = batch / "GOES-16" / "ACMF" / "20240401" / "00" / "a.nc"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"12345")
+            inventory = manifests / "manifest_inventory.csv"
+            inventory.write_text(
+                "target_time_utc,platform,product,remote_type,size_bytes,status,local_path\n"
+                "2024-04-01T00:00:00Z,GOES-16,ACMF,s3,5,found,{}\n".format(source),
+                encoding="utf-8",
+            )
+            (transfer / "batch_status.json").write_text(
+                json.dumps({"status": "running", "phase": "s3_download"}),
+                encoding="utf-8",
+            )
+            status_path = transfer / "auto_upload_status.json"
+            identity = Path(temp_dir) / "id_ed25519"
+            identity.write_text("key", encoding="utf-8")
+            final_manifest = transfer / "final_manifest.json"
+            with patch(
+                "geo_ring_cloud_auto_uploader.ensure_tools_and_identity"
+            ), patch(
+                "geo_ring_cloud_auto_uploader.latest_transfer_manifest",
+                side_effect=[None, final_manifest],
+            ), patch(
+                "geo_ring_cloud_auto_uploader.upload_batch", return_value=0
+            ), patch(
+                "geo_ring_cloud_auto_uploader.inspect_remote", return_value={}
+            ), patch(
+                "geo_ring_cloud_auto_uploader.upload_one"
+            ), patch(
+                "geo_ring_cloud_auto_uploader.discover_completed_files",
+                side_effect=AssertionError("inventory index must avoid rglob"),
+            ), patch(
+                "geo_ring_cloud_auto_uploader.time.sleep"
+            ):
+                result = watch_and_upload(
+                    batch,
+                    "2024-04-01",
+                    "2024-04-01",
+                    ["GOES-16"],
+                    "dhr@example",
+                    identity,
+                    PurePosixPath("/data04/1/dhr/geo_ring_cloud_auto_upload"),
+                    PurePosixPath("/data04/1/dhr"),
+                    status_path,
+                    transfer / "server_verification.json",
+                    poll_seconds=0,
+                )
+            ledger = (
+                transfer / "continuous_upload_ledger.jsonl"
+            ).read_text(encoding="utf-8").splitlines()
+
+        self.assertEqual(result, 0)
+        self.assertEqual(len(ledger), 1)
+        self.assertEqual(json.loads(ledger[0])["local_path"], str(source))
 
 
 if __name__ == "__main__":

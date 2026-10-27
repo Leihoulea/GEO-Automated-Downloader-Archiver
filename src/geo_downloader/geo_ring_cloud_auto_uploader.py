@@ -19,6 +19,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -678,6 +679,164 @@ def append_stream_ledger(path: Path, row: Dict[str, object]) -> None:
         handle.flush()
 
 
+@dataclass(frozen=True)
+class PendingUpload:
+    platform: str
+    local_path: Path
+    relative: Path
+    expected_size: Optional[int]
+
+
+def parse_excluded_products(raw: object) -> Dict[str, set[str]]:
+    text = str(raw or "").strip()
+    result: Dict[str, set[str]] = {}
+    if not text:
+        return result
+    for pair in text.split(";"):
+        pair = pair.strip()
+        if ":" not in pair:
+            continue
+        platform, products = pair.split(":", 1)
+        platform = platform.strip()
+        selected = {item.strip() for item in products.split(",") if item.strip()}
+        if platform and selected:
+            result.setdefault(platform, set()).update(selected)
+    return result
+
+
+def inventory_files_for_batch(batch_root: Path) -> List[Path]:
+    manifests = batch_root / "manifests"
+    combined = manifests / "manifest_inventory.csv"
+    if combined.is_file():
+        return [combined]
+    legacy = manifests / "manifest_meteosat_inventory.csv"
+    return [legacy] if legacy.is_file() else []
+
+
+def expected_inventory_entries(
+    batch_root: Path,
+    start_date: str,
+    end_date: str,
+    platforms: Sequence[str],
+    excluded_products: object = "",
+) -> Dict[str, PendingUpload]:
+    """Build the exact pending upload set from the batch inventory.
+
+    Only ``found`` rows in range/platform are retained.  S3 rows carry an
+    authoritative byte size; other providers use the two-poll stability check
+    because their catalogue sizes are not the delivered payload sizes.
+    """
+    selected = set(platforms)
+    excluded = parse_excluded_products(excluded_products)
+    start_prefix = start_date + "T"
+    end_day = datetime.strptime(end_date, "%Y-%m-%d").date()
+    entries: Dict[str, PendingUpload] = {}
+    for inventory in inventory_files_for_batch(batch_root):
+        with inventory.open("r", newline="", encoding="utf-8-sig") as handle:
+            for row in csv.DictReader(handle):
+                if row.get("status") != "found":
+                    continue
+                platform = str(row.get("platform", ""))
+                if platform not in selected or platform not in PLATFORM_REMOTE_RELATIVE:
+                    continue
+                product = str(row.get("product", ""))
+                if platform in excluded and product in excluded[platform]:
+                    continue
+                target_time = str(row.get("target_time_utc", ""))
+                if target_time < start_prefix:
+                    continue
+                try:
+                    target_day = datetime.fromisoformat(
+                        target_time.replace("Z", "+00:00")
+                    ).date()
+                except ValueError:
+                    continue
+                if target_day > end_day:
+                    continue
+                local_text = str(row.get("local_path", "")).strip()
+                if not local_text:
+                    continue
+                local_path = Path(os.path.normpath(local_text))
+                if not local_path.is_absolute():
+                    local_path = batch_root / local_path
+                platform_root = batch_root / platform
+                try:
+                    relative = local_path.relative_to(platform_root)
+                except ValueError:
+                    try:
+                        relative = local_path.resolve().relative_to(
+                            platform_root.resolve()
+                        )
+                    except (OSError, ValueError):
+                        continue
+                if not relative.parts:
+                    continue
+                expected_size: Optional[int] = None
+                if str(row.get("remote_type", "")) == "s3":
+                    size_text = str(row.get("size_bytes", ""))
+                    if size_text.isdigit() and int(size_text) > 0:
+                        expected_size = int(size_text)
+                entries[str(local_path)] = PendingUpload(
+                    platform=platform,
+                    local_path=local_path,
+                    relative=relative,
+                    expected_size=expected_size,
+                )
+    return entries
+
+
+def group_pending_files(
+    entries: Dict[str, PendingUpload],
+) -> Dict[Path, List[str]]:
+    groups: Dict[Path, List[str]] = {}
+    for key, entry in entries.items():
+        groups.setdefault(entry.local_path.parent, []).append(key)
+    return groups
+
+
+def scan_pending_files(
+    entries: Dict[str, PendingUpload],
+    groups: Dict[Path, List[str]],
+    directory_mtimes: Dict[Path, int],
+    stable_signatures: Dict[str, Tuple[int, int]],
+    force: bool = False,
+) -> List[str]:
+    """Return pending keys whose final file is ready to upload.
+
+    A directory whose mtime did not change cannot have gained or lost a final
+    file because the downloader writes ``.part`` first and renames atomically.
+    ``force`` bypasses that shortcut for the periodic full reconciliation.
+    """
+    ready: List[str] = []
+    for directory, keys in list(groups.items()):
+        try:
+            directory_mtime = directory.stat().st_mtime_ns
+        except OSError:
+            continue
+        if not force and directory_mtimes.get(directory) == directory_mtime:
+            continue
+        directory_mtimes[directory] = directory_mtime
+        for key in list(keys):
+            entry = entries.get(key)
+            if entry is None:
+                continue
+            try:
+                stat = entry.local_path.stat()
+            except OSError:
+                continue
+            signature = (int(stat.st_size), int(stat.st_mtime_ns))
+            if (
+                entry.expected_size is not None
+                and int(stat.st_size) == entry.expected_size
+            ):
+                ready.append(key)
+            elif stable_signatures.get(key) == signature:
+                ready.append(key)
+            else:
+                stable_signatures[key] = signature
+    return ready
+
+
 def expected_inventory_files(
     batch_root: Path,
     start_date: str,
@@ -754,6 +913,7 @@ def watch_and_upload(
     max_upload_workers: int = MAX_UPLOAD_WORKERS,
     upload_max_attempts: int = DEFAULT_UPLOAD_MAX_ATTEMPTS,
     upload_retry_base_seconds: float = DEFAULT_UPLOAD_RETRY_BASE_SECONDS,
+    reconcile_seconds: int = 300,
 ) -> int:
     """Upload finalized files while the downloader continues, then reconcile fully."""
     batch_root = batch_root.resolve()
@@ -769,7 +929,15 @@ def watch_and_upload(
     completed = load_stream_ledger(ledger_path)
     completed_bytes = sum(int(row.get("size_bytes", 0)) for row in completed.values())
     expected_files = expected_inventory_files(batch_root, start_date, end_date, platforms)
+    pending_entries: Optional[Dict[str, PendingUpload]] = None
+    pending_by_dir: Dict[Path, List[str]] = {}
+    directory_mtimes: Dict[Path, int] = {}
     stable_signatures: Dict[str, Tuple[int, int]] = {}
+    ready_queue: List[Tuple[str, str, Path, Path, Optional[int]]] = []
+    queued_keys: set[str] = set()
+    index_excluded_products = ""
+    last_reconcile_at = 0.0
+    reconcile_seconds = max(30, int(reconcile_seconds))
     retry_count = 0
     started_at = utc_now()
 
@@ -829,6 +997,19 @@ def watch_and_upload(
             return False
 
     update()
+
+    def prune_ready_queue() -> None:
+        nonlocal ready_queue, queued_keys, pending_by_dir
+        if not ready_queue:
+            return
+        ready_queue = [item for item in ready_queue if item[0] not in completed]
+        queued_keys = {item[0] for item in ready_queue}
+        if pending_entries is not None:
+            for key in list(pending_entries):
+                if key in completed:
+                    pending_entries.pop(key, None)
+            pending_by_dir = group_pending_files(pending_entries)
+
     while True:
         final_manifest = latest_transfer_manifest(transfer_dir)
         if final_manifest is not None:
@@ -905,31 +1086,114 @@ def watch_and_upload(
                 )
                 return 2
 
-        discovered = discover_completed_files(batch_root, start_date, end_date, platforms)
-        current_paths = {str(path) for _, path, _ in discovered}
-        for missing in set(stable_signatures) - current_paths:
-            stable_signatures.pop(missing, None)
-
-        ready: List[Tuple[str, Path, Path, int]] = []
-        for platform, local_path, relative in discovered:
-            key = str(local_path)
-            if key in completed:
-                continue
-            stat = local_path.stat()
-            signature = (stat.st_size, stat.st_mtime_ns)
-            if stable_signatures.get(key) == signature:
-                ready.append((platform, local_path, relative, stat.st_size))
+        excluded_products = str(raw_batch.get("excluded_products", "") or "")
+        if pending_entries is None or excluded_products != index_excluded_products:
+            entries = expected_inventory_entries(
+                batch_root,
+                start_date,
+                end_date,
+                platforms,
+                excluded_products,
+            )
+            if entries or inventory_files_for_batch(batch_root):
+                pending_entries = {
+                    key: entry
+                    for key, entry in entries.items()
+                    if key not in completed
+                }
+                expected_files = len(entries)
+                pending_by_dir = group_pending_files(pending_entries)
+                directory_mtimes.clear()
+                stable_signatures.clear()
+                ready_queue.clear()
+                queued_keys.clear()
+                index_excluded_products = excluded_products
+                last_reconcile_at = time.monotonic()
             else:
-                stable_signatures[key] = signature
+                pending_entries = None
 
-        if expected_files == 0:
-            expected_files = expected_inventory_files(batch_root, start_date, end_date, platforms)
+        discovered_count = 0
+        if pending_entries is not None:
+            force_reconcile = (
+                time.monotonic() - last_reconcile_at >= reconcile_seconds
+            )
+            if force_reconcile:
+                last_reconcile_at = time.monotonic()
+            ready_keys = scan_pending_files(
+                pending_entries,
+                pending_by_dir,
+                directory_mtimes,
+                stable_signatures,
+                force=force_reconcile,
+            )
+            for key in ready_keys:
+                entry = pending_entries.get(key)
+                if entry is None or key in queued_keys:
+                    continue
+                ready_queue.append(
+                    (
+                        key,
+                        entry.platform,
+                        entry.local_path,
+                        entry.relative,
+                        entry.expected_size,
+                    )
+                )
+                queued_keys.add(key)
+            discovered_count = len(pending_entries) + len(completed)
+        else:
+            now = time.monotonic()
+            if now - last_reconcile_at < reconcile_seconds:
+                update(
+                    phase="watching_download",
+                    discovered_files=0,
+                    completed_files=len(completed),
+                    file_count=expected_files,
+                    percent=(
+                        round(len(completed) / expected_files * 100, 2)
+                        if expected_files
+                        else 0.0
+                    ),
+                    current_file="",
+                    active_workers=0,
+                    parallelism_reason="waiting_for_inventory_or_reconcile",
+                )
+                time.sleep(max(2, poll_seconds))
+                continue
+            last_reconcile_at = now
+            discovered = discover_completed_files(
+                batch_root, start_date, end_date, platforms
+            )
+            discovered_count = len(discovered)
+            current_paths = {str(path) for _, path, _ in discovered}
+            for missing in set(stable_signatures) - current_paths:
+                stable_signatures.pop(missing, None)
 
+            for platform, local_path, relative in discovered:
+                key = str(local_path)
+                if key in completed or key in queued_keys:
+                    continue
+                stat = local_path.stat()
+                signature = (stat.st_size, stat.st_mtime_ns)
+                if stable_signatures.get(key) == signature:
+                    ready_queue.append(
+                        (key, platform, local_path, relative, stat.st_size)
+                    )
+                    queued_keys.add(key)
+                else:
+                    stable_signatures[key] = signature
+
+            if expected_files == 0:
+                expected_files = expected_inventory_files(
+                    batch_root, start_date, end_date, platforms
+                )
+
+        ready = ready_queue
         if ready:
             batch = ready[:8]
             remote_paths = [
                 str(server_root / PLATFORM_REMOTE_RELATIVE[platform] / PurePosixPath(relative.as_posix()))
-                for platform, _, relative, _ in batch
+                for key, platform, _, relative, _ in batch
             ]
             directories = sorted({str(PurePosixPath(path).parent) for path in remote_paths})
             try:
@@ -942,19 +1206,24 @@ def watch_and_upload(
                     directories,
                     connect_timeout,
                 )
-                for (platform, local_path, relative, expected_size), remote_path in zip(batch, remote_paths):
+                for (key, platform, local_path, relative, expected_size), remote_path in zip(batch, remote_paths):
                     update(
                         phase="streaming_upload",
                         current_file=str(local_path),
-                        discovered_files=len(discovered),
+                        discovered_files=discovered_count,
                         active_workers=1,
                         parallelism_reason="download_active_single_stream",
                     )
                     before = local_path.stat()
+                    if expected_size is None:
+                        expected_size = int(before.st_size)
+                    elif int(before.st_size) != expected_size:
+                        stable_signatures.pop(key, None)
+                        continue
                     digest = sha256_for_file(local_path, checksum_cache)
                     after = local_path.stat()
                     if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
-                        stable_signatures.pop(str(local_path), None)
+                        stable_signatures.pop(key, None)
                         continue
                     remote_state = remote.get(remote_path, {})
                     final_size = remote_state.get("final_size")
@@ -991,7 +1260,7 @@ def watch_and_upload(
                         "remote_preexisting": final_size is not None,
                     }
                     append_stream_ledger(ledger_path, row)
-                    completed[str(local_path)] = row
+                    completed[key] = row
                     completed_bytes += expected_size
                     retry_count = 0
                     update(
@@ -1013,12 +1282,13 @@ def watch_and_upload(
                     last_error="{}: {}".format(type(exc).__name__, exc),
                     current_file="",
                 )
+                prune_ready_queue()
                 time.sleep(min(300, poll_seconds * (2 ** min(retry_count, 5))))
                 continue
         else:
             update(
                 phase="watching_download",
-                discovered_files=len(discovered),
+                discovered_files=discovered_count,
                 completed_files=len(completed),
                 file_count=expected_files,
                 percent=(
@@ -1030,6 +1300,7 @@ def watch_and_upload(
                 active_workers=0,
                 parallelism_reason="waiting_for_finalized_files",
             )
+        prune_ready_queue()
         time.sleep(max(2, poll_seconds))
 
 
@@ -1427,6 +1698,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--end-date")
     parser.add_argument("--platform", action="append", default=[])
     parser.add_argument("--poll-seconds", type=int, default=10)
+    parser.add_argument(
+        "--reconcile-seconds",
+        type=int,
+        default=300,
+        help="Fallback full-tree reconciliation interval when inventory is absent.",
+    )
     parser.add_argument("--connect-timeout", type=int, default=20)
     parser.add_argument(
         "--max-upload-workers",
@@ -1489,6 +1766,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             args.max_upload_workers,
             args.upload_max_attempts,
             args.upload_retry_base_seconds,
+            args.reconcile_seconds,
         )
     return upload_batch(
         manifest_path,

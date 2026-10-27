@@ -5,8 +5,9 @@
 - 相关提交：
   - `a24831a` `fix: reduce dashboard I/O load to prevent system instability`（上一版，已在 `origin/main`）
   - `9a1f87e` `perf: reduce dashboard and queue scheduling I/O pressure`（第一轮，已 push）
-  - 第二轮（P0-6 boto3 client 复用 + P0-5b checksum cache）：见 `git log` 最新提交；提交状态见第 9 节
-- 测试：第一轮 `69 passed`；第二轮 `74 passed`
+  - 第二轮（P0-6 boto3 client 复用 + P0-5b checksum cache）：`07da3e7`，已 push
+  - 第三轮（P0-5a 上传器 pending 索引）：见 `git log` 最新提交；提交状态见第 10 节
+- 测试：第一轮 `69 passed`；第二轮 `74 passed`；第三轮 `78 passed`
 - 数据安全：未修改任何自动删除策略；`automatic_delete` 仍为 `False`
 
 ---
@@ -15,7 +16,7 @@
 
 ### 1.1 用户现象
 
-用户怀疑当前项目的设计会导致这台 Windows 电脑蓝屏重启，要求先做审计，再按 P0-1～P0-4 修复。第一轮完成后，继续处理 P0-6（boto3 client 复用）和 P0-5b（重复 SHA-256）。
+用户怀疑当前项目的设计会导致这台 Windows 电脑蓝屏重启，要求先做审计，再按 P0-1～P0-4 修复。第一轮完成后，继续处理 P0-6（boto3 client 复用）、P0-5b（重复 SHA-256）和 P0-5a（上传器全树扫描）。
 
 ### 1.2 系统日志证据
 
@@ -174,6 +175,7 @@ python -m pytest -q
 ```text
 第一轮：69 passed
 第二轮：74 passed
+第三轮：78 passed
 ```
 
 第二轮新增：
@@ -264,22 +266,23 @@ Windows 蓝屏需要同时看：
 
 ## 6. 未改内容与后续建议
 
-以下内容在第二轮之后**仍未修改**，下一个对话应优先评估。
+以下内容在第三轮之后**仍未修改**，下一个对话应优先评估。
 
-### 6.1 上传器全树扫描（原审计 P0-5a）
+### 6.1 上传器全树扫描（原审计 P0-5a，已完成）
 
 文件：`src/geo_downloader/geo_ring_cloud_auto_uploader.py`
 
-- `watch_and_upload()` 仍然每 10 秒调用 `discover_completed_files()`。
-- `iter_batch_files()` 内部仍使用 `sorted(platform_root.rglob("*"))`，会把整棵树路径一次性物化。
-- P0-5b 已解决重复 SHA-256，但“发现文件”这一步仍会全树扫描。
+已修：
 
-建议：
-
-- 用 inventory / download plan 建立 pending 索引。
+- `watch_and_upload()` 在 inventory 存在时使用 pending 索引，不再每 10 秒 `sorted(rglob("*"))`。
 - 按目录 `mtime_ns` 跳过未变化目录，只 `stat` pending 文件。
-- inventory 缺失时用 `os.scandir` + 慢速对账（例如 300 秒）回退。
-- 把 `excluded_products` 写入 `batch_status.json`，避免等待被排除的产品。
+- `batch_status.json` 增加 `excluded_products`，pending 分母不再包含被排除的产品。
+- inventory 缺失时回退到 `reconcile_seconds`（默认 300 秒）的慢速全树对账。
+
+仍然存在的边界：
+
+- pending 索引依赖 inventory 的 `local_path` 与 `batch_root` 一致；不一致的行会被跳过。
+- inventory 完全缺失时，上传器只能依赖慢速回退对账。
 
 ### 6.2 下载器资源使用（原审计 P0-6，部分完成）
 
@@ -427,9 +430,14 @@ D:\AAAresearch_paper\third_report\code\geo_cloud_download\...
   a24831a..9a1f87e  main -> main
   ```
 
-- 第二轮代码已修改并通过 `74 passed`，但**尚未提交**。
-- 第一轮结束时本地与 `origin/main` 同步。
-- 以下文件仍是未跟踪状态，未纳入第一轮提交：
+- 第二轮 `07da3e7` 已 push：
+
+  ```text
+  9dc6e2f..07da3e7  main -> main
+  ```
+
+- 第三轮代码已修改并通过 `78 passed`，但**尚未提交**。
+- 以下文件仍是未跟踪状态，未纳入任何一轮提交：
 
   ```text
   AGENTS.md
@@ -512,3 +520,68 @@ D:\AAAresearch_paper\third_report\code\geo_cloud_download\...
 - `test_goes_daily_inventory_reuses_supplied_client_state`
 
 测试结果：`74 passed`。
+
+---
+
+## 10. 第三轮改动明细（P0-5a：上传器 pending 索引）
+
+文件：`src/geo_downloader/geo_ring_cloud_auto_uploader.py`
+
+### 10.1 新增数据结构与辅助函数
+
+- `PendingUpload`：`platform / local_path / relative / expected_size`。
+- `parse_excluded_products()`：解析 `platform:product1,product2;...`。
+- `inventory_files_for_batch()`：优先 `manifest_inventory.csv`，否则回退
+  `manifest_meteosat_inventory.csv`。
+- `expected_inventory_entries()`：
+  - 只保留 `status=found`、日期/平台范围内、未被排除的 inventory 行。
+  - S3 行使用权威 `size_bytes`；EUMETSAT/EPIC 使用 `None`，依赖两次轮询稳定。
+  - 用 `local_path` 去重。
+- `group_pending_files()`：按父目录分组。
+- `scan_pending_files()`：
+  - 目录 `mtime_ns` 未变化时跳过该目录下所有 pending 文件。
+  - S3 预期大小匹配立即 ready；其他源需要连续两次 `(size, mtime_ns)` 一致。
+  - `force=True` 用于周期性完整对账。
+
+### 10.2 watch_and_upload 行为
+
+- 有 inventory 时：
+  - 建立 pending 索引，只 `stat` pending 文件。
+  - `ready_queue` 保存已判定 ready 但尚未上传的文件。
+  - 每轮最多上传 8 个；未上传的留在队列，下一轮继续，不受目录 mtime 跳过影响。
+  - 成功上传后从 pending 和 ready queue 移除。
+  - 上传失败/文件变化时保留在队列，下一轮重试。
+- 无 inventory 时：
+  - 回退到 `discover_completed_files()`。
+  - 扫描间隔由 `--reconcile-seconds` 控制，默认 300 秒；不再每 10 秒全树扫描。
+- `expected_files` 使用 inventory 条目总数，排除产品不再计入分母。
+- 目录 mtime 优化对下载器安全：下载器先写 `.part`，再 `os.replace` 成最终文件，目录 mtime 会变化。
+
+### 10.3 PS1 变更
+
+`geo_ring_cloud_transfer_batch.ps1`：
+
+- `Write-BatchStatus` 增加：
+
+  ```powershell
+  excluded_products = $ExcludedProducts
+  ```
+
+- 上传器从 `batch_status.json` 读取该字段，重建 pending 索引时会自动应用排除产品。
+
+### 10.4 第三轮新增测试
+
+- `test_parse_excluded_products_supports_platform_pairs`
+- `test_expected_inventory_entries_filters_and_uses_s3_size`
+- `test_scan_pending_files_uses_size_and_two_poll_stability`
+- `test_watch_and_upload_uses_inventory_index_instead_of_rglob`
+
+测试结果：`78 passed`。
+
+### 10.5 第三轮验证要点
+
+- 有 inventory 时，`discover_completed_files()` 不被调用（测试用 `AssertionError` 断言）。
+- 第一次扫描时对象大小匹配即 ready。
+- 目录 mtime 不变时第二次扫描不重复 `stat`。
+- `force=True` 时稳定性检查仍能发现 ready 文件。
+- `excluded_products` 正确过滤 pending 分母。
