@@ -181,6 +181,18 @@ def prepare_manifest(
         )
 
     rows: List[Dict[str, object]] = []
+    try:
+        from geo_ring_cloud.checksums import (
+            CACHE_FILE_NAME,
+            ChecksumCache,
+            sha256_for_file,
+        )
+
+        checksum_cache = ChecksumCache(output_dir / CACHE_FILE_NAME)
+        hash_file = lambda path: sha256_for_file(path, checksum_cache)
+    except (ImportError, OSError):
+        hash_file = sha256_file
+
     for platform, local_path, relative in iter_batch_files(
         batch_root, start_day, end_day, platforms
     ):
@@ -197,7 +209,7 @@ def prepare_manifest(
                 "local_path": str(local_path),
                 "remote_path": str(remote_path),
                 "size_bytes": local_path.stat().st_size,
-                "sha256": sha256_file(local_path),
+                "sha256": hash_file(local_path),
             }
         )
 

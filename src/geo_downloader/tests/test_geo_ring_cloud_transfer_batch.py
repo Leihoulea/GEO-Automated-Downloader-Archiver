@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
@@ -46,6 +47,7 @@ from geo_ring_cloud.batch_queue import (  # noqa: E402
     refine_estimate_from_inventory,
 )
 import geo_cloud_downloader  # noqa: E402
+import geo_ring_cloud.checksums as checksums  # noqa: E402
 import geo_ring_cloud_transfer_dashboard as transfer_dashboard  # noqa: E402
 from geo_ring_cloud.notifications import (  # noqa: E402
     PersistentEmailNotifier,
@@ -1691,6 +1693,106 @@ class TransferBatchTests(unittest.TestCase):
         self.assertFalse(slots.acquire(blocking=False))
         slots.release()
         slots.release()
+
+    def test_checksum_cache_reuses_digest_and_invalidates_on_change(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "sample.nc"
+            target.write_bytes(b"payload")
+            cache = checksums.ChecksumCache(root / "checksum_cache.jsonl")
+            with patch.object(
+                checksums, "sha256_file", wraps=checksums.sha256_file
+            ) as hasher:
+                first = checksums.sha256_for_file(target, cache)
+                second = checksums.sha256_for_file(target, cache)
+                self.assertEqual(first, hashlib.sha256(b"payload").hexdigest())
+                self.assertEqual(second, first)
+                self.assertEqual(hasher.call_count, 1)
+
+                target.write_bytes(b"payload-changed")
+                third = checksums.sha256_for_file(target, cache)
+
+        self.assertNotEqual(third, first)
+        self.assertEqual(hasher.call_count, 2)
+
+    def test_checksum_cache_is_shared_across_instances(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "sample.nc"
+            target.write_bytes(b"shared-payload")
+            cache_path = root / "checksum_cache.jsonl"
+            first_cache = checksums.ChecksumCache(cache_path)
+            first = checksums.sha256_for_file(target, first_cache)
+            second_cache = checksums.ChecksumCache(cache_path)
+            with patch.object(
+                checksums, "sha256_file", wraps=checksums.sha256_file
+            ) as hasher:
+                second = checksums.sha256_for_file(target, second_cache)
+
+        self.assertEqual(second, first)
+        self.assertEqual(hasher.call_count, 0)
+
+    def test_prepare_manifest_reuses_checksum_cache(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data = root / "GOES-18" / "ACMF" / "20240401" / "00" / "sample.nc"
+            data.parent.mkdir(parents=True)
+            data.write_bytes(b"complete-data")
+            transfer = root / "transfer"
+            with patch.object(
+                checksums, "sha256_file", wraps=checksums.sha256_file
+            ) as hasher:
+                prepare_manifest(
+                    root,
+                    transfer,
+                    PurePosixPath("/server/data/dhr"),
+                    "2024-04-01",
+                    "2024-04-01",
+                    {"GOES-18"},
+                )
+                manifest = prepare_manifest(
+                    root,
+                    transfer,
+                    PurePosixPath("/server/data/dhr"),
+                    "2024-04-01",
+                    "2024-04-01",
+                    {"GOES-18"},
+                )
+                self.assertEqual(hasher.call_count, 1)
+
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+            self.assertEqual(
+                payload["files"][0]["sha256"],
+                hashlib.sha256(b"complete-data").hexdigest(),
+            )
+
+    def test_thread_s3_client_reuses_one_client_per_run_state(self):
+        state = threading.local()
+        with patch.object(
+            geo_cloud_downloader, "get_s3_client", return_value=object()
+        ) as factory:
+            first = geo_cloud_downloader.thread_s3_client(state)
+            second = geo_cloud_downloader.thread_s3_client(state)
+
+        self.assertIs(first, second)
+        self.assertEqual(factory.call_count, 1)
+
+    def test_goes_daily_inventory_reuses_supplied_client_state(self):
+        day = datetime(2024, 4, 1, tzinfo=timezone.utc)
+        state = threading.local()
+        with patch.object(
+            geo_cloud_downloader, "get_s3_client", return_value=object()
+        ) as factory, patch.object(
+            geo_cloud_downloader, "list_s3_objects", return_value=[]
+        ):
+            geo_cloud_downloader.inventory_goes_day(
+                Path("batch"), day, "GOES-16", "ABI-L2-ACMF", client_state=state
+            )
+            geo_cloud_downloader.inventory_goes_day(
+                Path("batch"), day, "GOES-16", "ABI-L2-ACMF", client_state=state
+            )
+
+        self.assertEqual(factory.call_count, 1)
 
     def test_s3_inventory_refinement_is_cached_until_inventory_changes(self):
         with tempfile.TemporaryDirectory() as temp_dir:

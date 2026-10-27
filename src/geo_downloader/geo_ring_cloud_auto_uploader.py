@@ -34,11 +34,15 @@ from geo_ring_cloud.heartbeat import (
     should_heartbeat,
     UPLOAD_HEARTBEAT_NAME,
 )  # noqa: E402
+from geo_ring_cloud.checksums import (
+    CACHE_FILE_NAME,
+    ChecksumCache,
+    sha256_for_file,
+)  # noqa: E402
 from geo_ring_cloud_transfer_batch import (
     PLATFORM_REMOTE_RELATIVE,
     iter_batch_files,
     parse_day,
-    sha256_file,
 )
 
 
@@ -190,6 +194,7 @@ def build_auto_upload_manifest(
     source_files = list(source.get("files", []))
     if not source_files:
         raise RuntimeError("Transfer manifest contains no files")
+    checksum_cache = ChecksumCache(source_manifest_path.parent / CACHE_FILE_NAME)
     total_source_bytes = sum(int(item.get("size_bytes", 0) or 0) for item in source_files)
     remapped_files: List[Dict[str, object]] = []
     prepared_files = 0
@@ -214,7 +219,7 @@ def build_auto_upload_manifest(
         # their checksum inside this detached uploader process so the dashboard
         # remains responsive, but reject a source that changes while hashing.
         if not str(new_item.get("sha256", "")).strip():
-            new_item["sha256"] = sha256_file(local_path)
+            new_item["sha256"] = sha256_for_file(local_path, checksum_cache)
         after = local_path.stat()
         if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
             raise RuntimeError("Local source changed while hashing: {}".format(local_path))
@@ -754,6 +759,7 @@ def watch_and_upload(
     batch_root = batch_root.resolve()
     transfer_dir = batch_root / "transfer"
     ledger_path = transfer_dir / "continuous_upload_ledger.jsonl"
+    checksum_cache = ChecksumCache(transfer_dir / CACHE_FILE_NAME)
     validate_server_root(server_root, allowed_parent)
     ensure_tools_and_identity(identity_file)
     if not 1 <= max_upload_workers <= MAX_UPLOAD_WORKERS:
@@ -945,7 +951,7 @@ def watch_and_upload(
                         parallelism_reason="download_active_single_stream",
                     )
                     before = local_path.stat()
-                    digest = sha256_file(local_path)
+                    digest = sha256_for_file(local_path, checksum_cache)
                     after = local_path.stat()
                     if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
                         stable_signatures.pop(str(local_path), None)
@@ -980,6 +986,7 @@ def watch_and_upload(
                         "local_path": str(local_path),
                         "remote_path": remote_path,
                         "size_bytes": expected_size,
+                        "mtime_ns": before.st_mtime_ns,
                         "sha256": digest,
                         "remote_preexisting": final_size is not None,
                     }

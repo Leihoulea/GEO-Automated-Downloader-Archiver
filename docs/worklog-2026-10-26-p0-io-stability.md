@@ -1,11 +1,12 @@
-# 工作记录：仪表盘 / 队列 I/O 压力治理（P0-1～P0-4）
+# 工作记录：仪表盘 / 队列 I/O 压力治理（P0-1～P0-4）与上传器/下载器优化（P0-5b、P0-6）
 
 - 日期：2026-10-26
 - 仓库：`GEO-Automated-Downloader-Archiver`
 - 相关提交：
   - `a24831a` `fix: reduce dashboard I/O load to prevent system instability`（上一版，已在 `origin/main`）
-  - `9a1f87e` `perf: reduce dashboard and queue scheduling I/O pressure`（本次，已 push）
-- 测试：`69 passed`
+  - `9a1f87e` `perf: reduce dashboard and queue scheduling I/O pressure`（第一轮，已 push）
+  - 第二轮（P0-6 boto3 client 复用 + P0-5b checksum cache）：见 `git log` 最新提交；提交状态见第 9 节
+- 测试：第一轮 `69 passed`；第二轮 `74 passed`
 - 数据安全：未修改任何自动删除策略；`automatic_delete` 仍为 `False`
 
 ---
@@ -14,7 +15,7 @@
 
 ### 1.1 用户现象
 
-用户怀疑当前项目的设计会导致这台 Windows 电脑蓝屏重启，要求先做审计，再按 P0-1～P0-4 修复。
+用户怀疑当前项目的设计会导致这台 Windows 电脑蓝屏重启，要求先做审计，再按 P0-1～P0-4 修复。第一轮完成后，继续处理 P0-6（boto3 client 复用）和 P0-5b（重复 SHA-256）。
 
 ### 1.2 系统日志证据
 
@@ -171,16 +172,18 @@ python -m pytest -q
 结果：
 
 ```text
-69 passed
+第一轮：69 passed
+第二轮：74 passed
 ```
 
-另有：
+第二轮新增：
 
 ```powershell
 python -m py_compile `
-  src\geo_downloader\geo_ring_cloud_transfer_dashboard.py `
-  src\geo_downloader\geo_ring_cloud\batch_queue.py `
-  src\geo_downloader\tests\test_geo_ring_cloud_transfer_batch.py
+  src\geo_downloader\geo_ring_cloud\checksums.py `
+  src\geo_downloader\geo_ring_cloud_auto_uploader.py `
+  src\geo_downloader\geo_ring_cloud_transfer_batch.py `
+  src\geo_downloader\geo_cloud_downloader.py
 ```
 
 结果：编译通过。
@@ -196,6 +199,12 @@ python -m py_compile `
 - 空闲队列 tick 不扫描批次
 - S3 inventory 估算缓存复用
 - HTTP 并发线程上限
+- checksum cache 命中时不再重复读取文件
+- checksum cache 在 size/mtime 变化时失效
+- 两个 `ChecksumCache` 实例共享同一 JSONL
+- `prepare_manifest()` 第二次运行复用 checksum cache
+- 同一运行状态下 `thread_s3_client()` 只创建一个 client
+- 带 `client_state` 的每日 inventory 复用同一 client
 
 ---
 
@@ -255,35 +264,40 @@ Windows 蓝屏需要同时看：
 
 ## 6. 未改内容与后续建议
 
-以下内容本次**没有修改**，下一个对话应优先评估。
+以下内容在第二轮之后**仍未修改**，下一个对话应优先评估。
 
-### 6.1 上传器全树扫描与重复哈希（原审计 P0-5）
+### 6.1 上传器全树扫描（原审计 P0-5a）
 
 文件：`src/geo_downloader/geo_ring_cloud_auto_uploader.py`
 
-- `watch_and_upload()` 每 10 秒调用 `discover_completed_files()`。
-- `iter_batch_files()` 内部使用 `sorted(platform_root.rglob("*"))`，会把整棵树路径一次性物化。
-- 连续上传前对每个文件做 `sha256_file()`。
-- `prepare_manifest()` 与上传器可能对同一批数据重复做 SHA-256。
+- `watch_and_upload()` 仍然每 10 秒调用 `discover_completed_files()`。
+- `iter_batch_files()` 内部仍使用 `sorted(platform_root.rglob("*"))`，会把整棵树路径一次性物化。
+- P0-5b 已解决重复 SHA-256，但“发现文件”这一步仍会全树扫描。
 
 建议：
 
-- 改成增量索引，基于 manifest / `os.scandir` + mtime 缓存。
-- 全量 SHA-256 只做一次，写入 manifest 后复用。
-- 用锁避免 PS1 `prepare` 与连续上传器同时哈希。
+- 用 inventory / download plan 建立 pending 索引。
+- 按目录 `mtime_ns` 跳过未变化目录，只 `stat` pending 文件。
+- inventory 缺失时用 `os.scandir` + 慢速对账（例如 300 秒）回退。
+- 把 `excluded_products` 写入 `batch_status.json`，避免等待被排除的产品。
 
-### 6.2 下载器资源使用（原审计 P0-6）
+### 6.2 下载器资源使用（原审计 P0-6，部分完成）
 
 文件：`src/geo_downloader/geo_cloud_downloader.py`
 
-- `run_download_s3_range()` 的 worker 每个文件调用 `get_s3_client()`，没有连接复用。
+已修：
+
+- `run_download_s3_range()` 的 worker 不再每个文件新建 boto3 client；改为按运行/线程复用。
+- `inventory_goes_day()` / `inventory_himawari_day()` 支持共享 `client_state`。
+
+仍未改：
+
 - `run_inventory()` 一次性提交所有 job，所有结果累积在内存后写 CSV。
 - 16 路下载并发打开 NetCDF/HDF5 校验。
 - 每文件完成后写 `download_parallelism_status.json`，与大数据写入在同一块机械盘上交错。
 
 建议：
 
-- boto3 client 按线程复用。
 - inventory 分批落盘。
 - NetCDF/HDF5 校验限制为 1–2 路，或批次结束后统一校验。
 - 降低并发默认值（尤其机械盘）。
@@ -351,7 +365,7 @@ D:\AAAresearch_paper\third_report\code\geo_cloud_download\...
    git show --stat 9a1f87e
    ```
 
-2. 查看本次完整改动：
+2. 查看第一轮完整改动：
 
    ```powershell
    git show 9a1f87e -- src/geo_downloader/geo_ring_cloud_transfer_dashboard.py
@@ -359,7 +373,17 @@ D:\AAAresearch_paper\third_report\code\geo_cloud_download\...
    git show 9a1f87e -- src/geo_downloader/tests/test_geo_ring_cloud_transfer_batch.py
    ```
 
-3. 关键函数：
+3. 查看第二轮改动（提交后用实际 hash）：
+
+   ```powershell
+   git log --oneline -5
+   git show HEAD -- src/geo_downloader/geo_ring_cloud/checksums.py
+   git show HEAD -- src/geo_downloader/geo_cloud_downloader.py
+   git show HEAD -- src/geo_downloader/geo_ring_cloud_auto_uploader.py
+   git show HEAD -- src/geo_downloader/geo_ring_cloud_transfer_batch.py
+   ```
+
+4. 关键函数：
 
    - `DashboardState._process_batch_queue_once_unlocked`
    - `DashboardState.task_summaries`
@@ -370,33 +394,42 @@ D:\AAAresearch_paper\third_report\code\geo_cloud_download\...
    - `read_inventory_by_remote_type`
    - `BoundedThreadingHTTPServer`
    - `batch_queue._collect_authoritative_inventory`
+   - `geo_cloud_downloader.thread_s3_client`
+   - `geo_ring_cloud.checksums.ChecksumCache`
+   - `geo_ring_cloud.checksums.sha256_for_file`
+   - `prepare_manifest()` 内部的 checksum cache 接入
+   - `watch_and_upload()` / `build_auto_upload_manifest()` 的 cache 接入
 
-4. 跑测试：
+5. 跑测试：
 
    ```powershell
    python -m pytest -q
    ```
 
-5. 下一步优先级：
+6. 下一步优先级：
 
-   1. 上传器增量扫描 + 单次哈希（P0-5）
-   2. boto3 client 复用 + inventory 分批落盘（P0-6）
-   3. 禁用旧计划任务/旧副本
-   4. 硬件/驱动排查
-   5. 视情况降低默认下载/上传并发
+   1. 上传器 pending 索引（P0-5a）：消除每 10 秒 `rglob`
+   2. inventory 分批落盘 + NetCDF 校验限流（P0-6 剩余）
+   3. PS1 输出改为流式写入
+   4. 禁用旧计划任务/旧副本
+   5. 硬件/驱动排查
+   6. 视情况降低默认下载/上传并发
 
 ---
 
 ## 8. 当前 Git 状态
 
-- 本次提交已 push：
+截至本文档更新时：
+
+- 第一轮 `9a1f87e` 已 push：
 
   ```text
   a24831a..9a1f87e  main -> main
   ```
 
-- 本地与 `origin/main` 同步。
-- 以下文件仍是未跟踪状态，未纳入本次提交：
+- 第二轮代码已修改并通过 `74 passed`，但**尚未提交**。
+- 第一轮结束时本地与 `origin/main` 同步。
+- 以下文件仍是未跟踪状态，未纳入第一轮提交：
 
   ```text
   AGENTS.md
@@ -407,3 +440,75 @@ D:\AAAresearch_paper\third_report\code\geo_cloud_download\...
   ```
 
   这些文件在本次工作开始前就已存在，是否提交需要用户单独确认。
+
+---
+
+## 9. 第二轮改动明细（P0-6 + P0-5b）
+
+### 9.1 P0-6：boto3 client 按运行/线程复用
+
+文件：`src/geo_downloader/geo_cloud_downloader.py`
+
+- 新增 `thread_s3_client(state)`：
+  - 从调用方提供的 `threading.local()` 中取 client。
+  - 没有则创建一次并缓存。
+- `run_inventory()`：
+  - 创建 `inventory_client_state = threading.local()`。
+  - GOES / Himawari 每日 job 通过 lambda 传入同一个 state。
+- `inventory_goes_day()`、`inventory_himawari_day()`：
+  - 新增可选 `client_state` 参数。
+  - 不传时保持旧行为（直接 `get_s3_client()`），方便直接调用和测试。
+- `run_download_s3_range()`：
+  - 创建 `download_client_state = threading.local()`。
+  - worker 使用 `thread_s3_client(download_client_state)`。
+
+效果：
+
+- 16 个下载线程最多 16 个 client，而不是每个文件一个。
+- inventory 的每个工作线程也复用 client。
+- 没有引入全局 thread-local，避免测试之间互相污染。
+
+### 9.2 P0-5b：持久化 SHA-256 cache
+
+新增文件：`src/geo_downloader/geo_ring_cloud/checksums.py`
+
+- `ChecksumCache`：
+  - JSONL 缓存，默认 `<batch>/transfer/checksum_cache.jsonl`。
+  - 键为 `(resolved local_path, size_bytes, mtime_ns)`。
+  - 支持增量读取，避免每次加载整个文件。
+- `sha256_for_file(path, cache)`：
+  - 先查缓存。
+  - miss 时获取跨进程锁 `transfer/checksum.lock`。
+  - 拿锁后重新查一次，再计算 SHA-256。
+  - 计算前后校验 `size/mtime_ns`，文件变化则重试一次，避免缓存坏摘要。
+- 跨进程锁：
+  - Windows 使用 `msvcrt.locking()`。
+  - POSIX 使用 `fcntl.flock()`。
+  - 等待超时默认 3600 秒。
+
+接入点：
+
+- `prepare_manifest()`：
+  - 本地执行时使用 `ChecksumCache(output_dir / "checksum_cache.jsonl")`。
+  - 服务器端独立验证脚本没有该模块时，自动回退到原来的 `sha256_file()`。
+- `build_auto_upload_manifest()`：
+  - 只有 manifest 里缺 `sha256` 时才计算，且优先使用 cache。
+- `watch_and_upload()`：
+  - 上传前计算前先查 cache。
+  - ledger 行新增 `mtime_ns`，方便后续审计和复用。
+
+效果：
+
+- 同一文件在 `prepare`、连续上传、自动上传 manifest 之间最多计算一次。
+- 第二次对未变化批次执行 `prepare` 时，不再全量读取数据文件。
+- PS1 `prepare` 与连续上传器即使并发，也会通过锁串行化同一文件的哈希，避免重复读盘。
+
+### 9.3 第二轮新增测试
+
+- `test_checksum_cache_reuses_digest_and_invalidates_on_change`
+- `test_checksum_cache_is_shared_across_instances`
+- `test_prepare_manifest_reuses_checksum_cache`
+- `test_thread_s3_client_reuses_one_client_per_run_state`
+- `test_goes_daily_inventory_reuses_supplied_client_state`
+
+测试结果：`74 passed`。

@@ -583,6 +583,20 @@ def get_s3_client():
     )
 
 
+def thread_s3_client(state) -> object:
+    """Return one boto3 client per worker thread for the current run.
+
+    Creating a client for every file repeatedly builds connection pools and
+    service metadata.  The caller supplies a ``threading.local`` scoped to one
+    inventory/download run so test patches and separate runs stay isolated.
+    """
+    client = getattr(state, "client", None)
+    if client is None:
+        client = get_s3_client()
+        state.client = client
+    return client
+
+
 def list_s3_objects(s3_client, bucket: str, prefix: str) -> list[dict]:
     paginator = s3_client.get_paginator("list_objects_v2")
     objects: list[dict] = []
@@ -754,13 +768,20 @@ def inventory_himawari(root: Path, s3_client, target_time: datetime) -> list[dic
     return rows
 
 
-def inventory_goes_day(root: Path, day: datetime, platform: str, full_product: str) -> list[dict]:
+def inventory_goes_day(
+    root: Path,
+    day: datetime,
+    platform: str,
+    full_product: str,
+    client_state=None,
+) -> list[dict]:
     """List one daily prefix once, then select all 24 hourly targets locally."""
     cfg = GOES_CONFIG[platform]
     short_product = cfg["short_products"][full_product]
     prefix = f"{full_product}/{day:%Y}/{day:%j}/"
     try:
-        objects = list_s3_objects(get_s3_client(), cfg["bucket"], prefix)
+        s3_client = thread_s3_client(client_state) if client_state is not None else get_s3_client()
+        objects = list_s3_objects(s3_client, cfg["bucket"], prefix)
         listing_error = ""
     except Exception as exc:
         objects = []
@@ -812,12 +833,13 @@ def inventory_goes_day(root: Path, day: datetime, platform: str, full_product: s
     return rows
 
 
-def inventory_himawari_day(root: Path, day: datetime) -> list[dict]:
+def inventory_himawari_day(root: Path, day: datetime, client_state=None) -> list[dict]:
     """List one Himawari daily prefix once and build the hourly rows locally."""
     cfg = HIMAWARI_CONFIG
     prefix = f"{cfg['base_prefix']}/{day:%Y/%m/%d}/"
     try:
-        objects = list_s3_objects(get_s3_client(), cfg["bucket"], prefix)
+        s3_client = thread_s3_client(client_state) if client_state is not None else get_s3_client()
+        objects = list_s3_objects(s3_client, cfg["bucket"], prefix)
         listing_error = ""
     except Exception as exc:
         objects = []
@@ -1940,6 +1962,7 @@ def run_inventory(
         return out_path
 
     jobs: list[tuple[str, Callable[[], list[dict]]]] = []
+    inventory_client_state = threading.local()
     for day in days:
         if include_goes:
             for platform in sorted(selected.intersection(GOES_CONFIG)):
@@ -1947,8 +1970,8 @@ def run_inventory(
                     jobs.append(
                         (
                             f"{day:%Y-%m-%d} {platform} {full_product}",
-                            lambda day=day, platform=platform, full_product=full_product: inventory_goes_day(
-                                root, day, platform, full_product
+                            lambda day=day, platform=platform, full_product=full_product, client_state=inventory_client_state: inventory_goes_day(
+                                root, day, platform, full_product, client_state=client_state
                             ),
                         )
                     )
@@ -1956,7 +1979,9 @@ def run_inventory(
             jobs.append(
                 (
                     f"{day:%Y-%m-%d} {HIMAWARI_CONFIG['platform']}",
-                    lambda day=day: inventory_himawari_day(root, day),
+                    lambda day=day, client_state=inventory_client_state: inventory_himawari_day(
+                        root, day, client_state=client_state
+                    ),
                 )
             )
         if include_selected_meteosat:
@@ -2481,8 +2506,10 @@ def run_download_s3_range(
         )
         log.flush()
 
+        download_client_state = threading.local()
+
         def worker(row: dict) -> dict:
-            s3_client = get_s3_client()
+            s3_client = thread_s3_client(download_client_state)
             success, note = download_s3_row(s3_client, row, range_mib=range_mib)
             out = dict(row)
             out["status"] = "downloaded" if success else "corrupt"
