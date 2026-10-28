@@ -7,7 +7,7 @@
   - `9a1f87e` `perf: reduce dashboard and queue scheduling I/O pressure`（第一轮，已 push）
   - 第二轮（P0-6 boto3 client 复用 + P0-5b checksum cache）：`07da3e7`，已 push
   - 第三轮（P0-5a 上传器 pending 索引）：见 `git log` 最新提交；提交状态见第 10 节
-- 测试：第一轮 `69 passed`；第二轮 `74 passed`；第三轮 `78 passed`
+- 测试：第一轮 `69 passed`；第二轮 `74 passed`；第三轮 `79 passed`
 - 数据安全：未修改任何自动删除策略；`automatic_delete` 仍为 `False`
 
 ---
@@ -175,7 +175,7 @@ python -m pytest -q
 ```text
 第一轮：69 passed
 第二轮：74 passed
-第三轮：78 passed
+第三轮：79 passed
 ```
 
 第二轮新增：
@@ -436,7 +436,7 @@ D:\AAAresearch_paper\third_report\code\geo_cloud_download\...
   9dc6e2f..07da3e7  main -> main
   ```
 
-- 第三轮代码已修改并通过 `78 passed`，但**尚未提交**。
+- 第三轮代码已修改并通过 `79 passed`，但**尚未提交**。
 - 以下文件仍是未跟踪状态，未纳入任何一轮提交：
 
   ```text
@@ -572,11 +572,12 @@ D:\AAAresearch_paper\third_report\code\geo_cloud_download\...
 ### 10.4 第三轮新增测试
 
 - `test_parse_excluded_products_supports_platform_pairs`
+- `test_expected_upload_count_includes_prior_ledger_entries`
 - `test_expected_inventory_entries_filters_and_uses_s3_size`
 - `test_scan_pending_files_uses_size_and_two_poll_stability`
 - `test_watch_and_upload_uses_inventory_index_instead_of_rglob`
 
-测试结果：`78 passed`。
+测试结果：`79 passed`。
 
 ### 10.5 第三轮验证要点
 
@@ -585,3 +586,4 @@ D:\AAAresearch_paper\third_report\code\geo_cloud_download\...
 - 目录 mtime 不变时第二次扫描不重复 `stat`。
 - `force=True` 时稳定性检查仍能发现 ready 文件。
 - `excluded_products` 正确过滤 pending 分母。
+- `expected_upload_count()` 会把“已上传但不在当前 inventory 中”的 ledger 记录计入分母，避免混合 inventory/ledger 时进度超过 100%。

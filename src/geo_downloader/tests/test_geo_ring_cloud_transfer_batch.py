@@ -34,6 +34,7 @@ from geo_ring_cloud_auto_uploader import (  # noqa: E402
     build_auto_upload_manifest,
     discover_completed_files,
     expected_inventory_entries,
+    expected_upload_count,
     group_pending_files,
     parse_excluded_products,
     progressive_upload_worker_counts,
@@ -1834,6 +1835,14 @@ class TransferBatchTests(unittest.TestCase):
         self.assertEqual(parsed["GOES-16"], {"ACHAF", "CTPF"})
         self.assertEqual(parsed["Meteosat-0deg"], {"CTH"})
         self.assertEqual(parse_excluded_products(""), {})
+
+    def test_expected_upload_count_includes_prior_ledger_entries(self):
+        current = Path("current.nc")
+        entries = {
+            str(current): PendingUpload("GOES-16", current, Path("current.nc"), 1)
+        }
+        completed = {str(current): {}, "previous.nc": {}}
+        self.assertEqual(expected_upload_count(entries, completed), 2)
 
     def test_expected_inventory_entries_filters_and_uses_s3_size(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -794,6 +794,18 @@ def group_pending_files(
     return groups
 
 
+def expected_upload_count(
+    entries: Dict[str, PendingUpload], completed: Dict[str, object]
+) -> int:
+    """Count inventory entries plus already-uploaded files outside this inventory.
+
+    A resumed batch can have a ledger from an earlier inventory (for example a
+    GOES-only ledger plus a Meteosat-only inventory).  Counting only the current
+    inventory would make ``completed_files`` exceed ``file_count``.
+    """
+    return len(entries) + sum(1 for key in completed if key not in entries)
+
+
 def scan_pending_files(
     entries: Dict[str, PendingUpload],
     groups: Dict[Path, List[str]],
@@ -1101,7 +1113,7 @@ def watch_and_upload(
                     for key, entry in entries.items()
                     if key not in completed
                 }
-                expected_files = len(entries)
+                expected_files = expected_upload_count(entries, completed)
                 pending_by_dir = group_pending_files(pending_entries)
                 directory_mtimes.clear()
                 stable_signatures.clear()
